@@ -1,0 +1,4 @@
+# Trajectory Log QA - build dependencies (Windows exe, Python 3.9+ x64)
+numpy>=1.23
+openpyxl>=3.0
+pyinstaller>=6.0

@@ -1,0 +1,46 @@
+name: Build Trajectory Log QA (Windows EXE + Installer)
+
+# בונה את TrajectoryLogQA.exe ואת TrajectoryLogQA_Setup.exe על שרת Windows.
+# רץ אוטומטית בכל push, וגם ידנית (Run workflow).
+
+on:
+  push:
+    branches: [ main, master, trj-build ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # x64 - numpy מצריך 64-ביט; ה-exe ירוץ על כל Windows 64-ביט
+      - name: Set up Python 3.11 (x64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy openpyxl pyinstaller
+
+      - name: Build TrajectoryLogQA.exe
+        run: pyinstaller --onefile --windowed --name TrajectoryLogQA --collect-all numpy trj_gui.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrajectoryLogQA-Windows
+          path: |
+            dist/TrajectoryLogQA.exe
+            Output/TrajectoryLogQA_Setup.exe
+          if-no-files-found: error
