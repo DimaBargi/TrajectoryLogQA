@@ -259,8 +259,12 @@ class App(object):
         self.status = ttk.Label(self.master, text="מוכן."); self.status.pack(anchor="e", padx=12)
         self.summary = ttk.Label(self.master, text="", font=("Helvetica", 11, "bold"))
         self.summary.pack(anchor="center", pady=4)
+        ttk.Label(self.master, font=("Helvetica", 9), foreground="#666",
+                  text="מקרא:  ◻ טיפול תקין   ▦ צהוב=הדמיה   ▦ אדום=חתוך   |   "
+                       "MLC RMS/max=דיוק עלים (מ\"מ)   |   'מקרא / עזרה' להסבר מלא").pack(anchor="center")
 
         flt = ttk.Frame(self.master); flt.pack(fill="x", padx=12, pady=(2, 4))
+        ttk.Button(flt, text="מקרא / עזרה", command=self.show_legend).pack(side="left", padx=(0, 8))
         ttk.Button(flt, text="ייצא ל-Excel", command=self.export_xlsx).pack(side="left")
         ttk.Button(flt, text="פתח CSV", command=self.open_csv).pack(side="left", padx=6)
         ttk.Button(flt, text="זמן בחדר", command=self.show_sessions).pack(side="left", padx=6)
@@ -455,6 +459,62 @@ class App(object):
                 w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(sess)
             messagebox.showinfo("הושלם", "נשמר:\n" + out)
         ttk.Button(win, text="ייצא sessions ל-CSV", command=exp_sess).pack(pady=4)
+
+    # ---------- מקרא / עזרה ----------
+    def show_legend(self):
+        win = tk.Toplevel(self.master)
+        win.title("מקרא והסבר - Trajectory Log QA")
+        win.geometry("780x660")
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True)
+        txt = tk.Text(frame, wrap="word", font=("Helvetica", 11), padx=12, pady=12)
+        sb = ttk.Scrollbar(frame, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        c = CLINICAL
+        content = (
+            "מקרא והסבר\n==========\n\n"
+            "עמודות הטבלה\n------------\n"
+            "קובץ        - שם קובץ הלוג (.bin)\n"
+            "מטופל       - מספר זהות המטופל\n"
+            "שדה         - שם השדה / הקשת\n"
+            "אנרגיה      - אנרגיית הקרן (6x, 10x, 10xFFF...)\n"
+            "משך (ש')    - משך ההקלטה בשניות (snapshots x 0.02)\n"
+            "MU          - מוניטור-יוניטס שנמסרו בפועל\n"
+            "MLC RMS     - שגיאת מיקום עלי MLC, ממוצע RMS (מ\"מ) - כמה העלים דייקו\n"
+            "MLC max     - שגיאת העלה המקסימלית (מ\"מ) - המקרה הקיצוני\n"
+            "גנטרי err   - שגיאת זווית הגנטרי המקסימלית (מעלות)\n"
+            "holds       - מספר עצירות קרן (gating / מעברי שדה / השהיות)\n"
+            "חתוך        - האם הלוג נקטע (טיפול > 20 דק'). True = נתונים חלקיים\n\n"
+            "צבעי שורות\n----------\n"
+            "לבן  - לוג טיפול תקין ומלא\n"
+            "צהוב - לוג הדמיה (kV/CBCT/setup) - אין MLC/מנה\n"
+            "אדום - לוג חתוך (truncated) - נתונים חלקיים\n\n"
+            "גבולות לדגל \"חשוד לאי-דיוק\"\n---------------------------\n"
+            "התוכנה מדגלת לוג בשתי דרכים:\n\n"
+            "1) ספים קליניים קבועים (מבוסס MPPG 8.b / TG-142):\n"
+            "   MLC RMS   > {rms:g} מ\"מ\n"
+            "   MLC max   > {emax:g} מ\"מ\n"
+            "   גנטרי err > {gan:g} מעלות\n"
+            "   סורגים    > {jaw:g} מ\"מ\n"
+            "   פער MU    > {mu:g}%\n"
+            "   לוג חתוך  = תמיד מדגל\n\n"
+            "2) חריג סטטיסטי: ערך מעל ממוצע + 3-sigma של המכונה שלך עצמה\n"
+            "   (חשוב במיוחד כי הערכים בפועל נמוכים בהרבה מהספים הקליניים)\n\n"
+            "לוג מסומן מופיע בחלון \"outliers / מטופלים\" עם הסיבה והניקוד.\n\n"
+            "חשוב\n----\n"
+            "הדגלים מודדים דיוק *מכני* (MLC/גנטרי/סורגים/MU) - מועמדים לאי-דיוק\n"
+            "במנה. אישור דוזימטרי מצריך מדידה (ArcCHECK). הלוג אינו רואה שגיאות\n"
+            "מודל-מנה ב-TPS או סחף כיול/פלט של המאיץ.\n"
+        ).format(rms=c["mlc_rms_max_mm"], emax=c["mlc_err_max_mm"],
+                 gan=c["max_gantry_error_deg"], jaw=c["max_jaw_error_cm"] * 10,
+                 mu=c["mu_diff_pct"])
+        txt.insert("1.0", content)
+        txt.tag_add("all", "1.0", "end")
+        txt.tag_configure("all", justify="right", spacing1=1)
+        txt.configure(state="disabled")
+        ttk.Button(win, text="סגור", command=win.destroy).pack(pady=4)
 
     # ---------- גרפיקה (matplotlib) ----------
     def _need_mpl(self):
