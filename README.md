@@ -43,8 +43,21 @@ beam-on, holds, duration, and per-session time-at-machine.
 
 ## Usage
 Run the app → **בחר תיקייה** (folder of `.bin` logs) → **הרץ ניתוח**. Results show in the
-table and save to `trajectory_qa_results.csv`. Buttons: Excel export, open CSV,
-**זמן בחדר** (per-session time-at-machine). Yellow rows = imaging; red = truncated.
+table and save to `trajectory_qa_results.csv`. Yellow rows = imaging; red = truncated.
+
+**Graphics & analysis (matplotlib):**
+- **התפלגות** — distribution histograms of MLC RMS / errors / holds (outlier tail in red).
+- **מגמה** — MLC RMS over time (machine-drift detection).
+- **גרף לוג** (or double-click a row) — per-snapshot traces: MLC error, gantry actual-vs-expected,
+  MU, with beam-holds shaded → shows *where* in the delivery a deviation occurred.
+- **outliers / מטופלים** — ranks suspect treatments by **clinical thresholds + statistical
+  (mean+3σ) outliers**, with the triggering reason, plus a per-patient rollup.
+- **זמן בחדר** — per-session time-at-machine.
+
+> The outlier flags are **mechanical** delivery accuracy (MLC/gantry/jaw/MU) — candidates for dose
+> inaccuracy. Dosimetric confirmation needs measurement (ArcCHECK); the log cannot see TPS
+> dose-model or machine output/calibration errors. Thresholds are editable consts (`CLINICAL`,
+> `Z_THRESHOLD`) at the top of `trj_gui.py`.
 
 ## Note on gamma/fluence
 This app reports everything **recorded in the log** + mechanical/MLC QA. Fluence-map **gamma**

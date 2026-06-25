@@ -193,6 +193,17 @@ def beam_on_mask(log: TrajectoryLog):
     return bh.astype(int) == 0
 
 
+def mlc_error_series(log: TrajectoryLog):
+    """Per-snapshot MLC leaf error for the per-log graph.
+
+    Returns (time_s, mean_err_mm, max_err_mm) over the whole delivery (no beam-off
+    masking, so the user sees where in the beam any deviation occurred)."""
+    exp, act = mlc_leaf_arrays(log)
+    err = np.abs(act - exp) * 10.0                      # cm -> mm
+    t = np.arange(err.shape[0]) * log.sampling_interval_ms / 1000.0
+    return t, err.mean(axis=1), err.max(axis=1)
+
+
 def qa_metrics(log: TrajectoryLog) -> dict:
     """Standard delivery-QA metrics, all from the raw axis data (no pylinac)."""
     m: dict = {
@@ -220,6 +231,13 @@ def qa_metrics(log: TrajectoryLog) -> dict:
     energy = str(log.metadata.get("energy", "")).lower()
     is_imaging = energy.endswith("k") or (mu_deliv is not None and mu_deliv < 0.01)
     m["is_imaging"] = is_imaging
+    # MU discrepancy (dose-relevant): delivered vs planned, %.
+    mu_plan = log.metadata.get("mu_planned")
+    if (not is_imaging and isinstance(mu_plan, (int, float)) and mu_plan > 0.01
+            and mu_deliv is not None):
+        m["mu_diff_pct"] = round((mu_deliv - mu_plan) / mu_plan * 100.0, 3)
+    else:
+        m["mu_diff_pct"] = ""
     # MLC leaf errors — actual vs expected. Log stores cm; report mm (×10, clinical).
     # Restrict to beam-ON snapshots to match pylinac's exclude_beam_off reference.
     if "mlc" in log.axes and not is_imaging:

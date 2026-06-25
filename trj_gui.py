@@ -39,13 +39,35 @@ try:
 except Exception:
     _OPENPYXL_OK = False
 
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt  # noqa: F401  (kept for Figure styling)
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
+                                                   NavigationToolbar2Tk)
+    _MPL_OK = True
+except Exception:
+    _MPL_OK = False
+
+# Clinical flag thresholds for "suspect mechanical-delivery accuracy" (editable).
+CLINICAL = {
+    "mlc_rms_max_mm": 0.5,        # mm
+    "mlc_err_max_mm": 1.0,        # mm
+    "max_gantry_error_deg": 0.5,  # deg
+    "max_jaw_error_cm": 0.1,      # cm (= 1 mm)
+    "mu_diff_pct": 0.5,           # %
+}
+Z_THRESHOLD = 3.0                 # statistical outlier: z > 3 vs the cohort
+FLAG_METRICS = list(CLINICAL.keys())
+
 APP_TITLE = "Davidoff Physics Trajectory Log"
 APP_SUBTITLE = "ניתוח קבצי Trajectory Log (.bin) - TrueBeam"
 
 # full output columns (CSV/Excel)
 COLUMNS = ["filename", "patient_id", "plan_name", "beam_name", "energy", "mlc_model",
            "num_snapshots", "sampling_interval_ms", "duration_s", "num_subbeams",
-           "mu_planned", "mu_delivered", "mlc_rms_avg_mm", "mlc_rms_max_mm",
+           "mu_planned", "mu_delivered", "mu_diff_pct", "mlc_rms_avg_mm", "mlc_rms_max_mm",
            "mlc_err_p95_mm", "mlc_err_max_mm", "max_gantry_error_deg",
            "max_collimator_error_deg", "max_jaw_error_cm", "num_beam_holds",
            "beam_hold_fraction", "beam_on_s", "is_truncated", "is_imaging",
@@ -90,10 +112,47 @@ def analyze_folder(root, progress_cb):
         except Exception as e:                       # corrupt/truncated: skip, continue
             row = {"filename": os.path.basename(path), "error": "%s: %s" % (type(e).__name__, e)}
             fails += 1
-        # session-timing helpers
+        # session-timing + per-log re-load helpers
         row["_dt"] = TB_parse_dt(os.path.basename(path))
+        row["_path"] = path
         rows.append(row)
     return rows, total, fails
+
+
+# ------------------------- outlier flagging -------------------------
+def cohort_stats(rows):
+    """mean/std per flag-metric over treatment (non-imaging, error-free) logs."""
+    import statistics
+    stats = {}
+    for k in FLAG_METRICS:
+        vals = [abs(r[k]) for r in rows if not r.get("is_imaging") and not r.get("error")
+                and isinstance(r.get(k), (int, float))]
+        if len(vals) >= 5:
+            stats[k] = (statistics.mean(vals), statistics.pstdev(vals) or 1e-9)
+    return stats
+
+
+def flag_log(row, stats):
+    """(score, reasons) for one treatment log: clinical thresholds + z>3 statistical."""
+    if row.get("is_imaging") or row.get("error"):
+        return 0.0, []
+    reasons, score = [], 0.0
+    for k in FLAG_METRICS:
+        v = row.get(k)
+        if not isinstance(v, (int, float)):
+            continue
+        av = abs(v)
+        thr = CLINICAL.get(k)
+        if thr is not None and av > thr:
+            reasons.append("{0} {1:g}>{2:g}".format(k, av, thr)); score += 100.0
+        if k in stats:
+            mu, sd = stats[k]
+            z = (av - mu) / sd
+            if z > Z_THRESHOLD:
+                reasons.append("{0} {1:.1f}σ".format(k, z)); score = max(score, z)
+    if row.get("is_truncated"):
+        reasons.append("truncated"); score += 100.0
+    return round(score, 2), reasons
 
 
 def TB_parse_dt(filename):
@@ -204,7 +263,11 @@ class App(object):
         flt = ttk.Frame(self.master); flt.pack(fill="x", padx=12, pady=(2, 4))
         ttk.Button(flt, text="ייצא ל-Excel", command=self.export_xlsx).pack(side="left")
         ttk.Button(flt, text="פתח CSV", command=self.open_csv).pack(side="left", padx=6)
-        ttk.Button(flt, text="זמן בחדר (sessions)", command=self.show_sessions).pack(side="left", padx=6)
+        ttk.Button(flt, text="זמן בחדר", command=self.show_sessions).pack(side="left", padx=6)
+        ttk.Button(flt, text="התפלגות", command=self.show_histograms).pack(side="left", padx=2)
+        ttk.Button(flt, text="מגמה", command=self.show_trend).pack(side="left", padx=2)
+        ttk.Button(flt, text="גרף לוג", command=self.show_log_graph).pack(side="left", padx=2)
+        ttk.Button(flt, text="outliers / מטופלים", command=self.show_outliers).pack(side="left", padx=2)
         ttk.Label(flt, text=":חיפוש").pack(side="right")
         e = ttk.Entry(flt, textvariable=self.search, width=16); e.pack(side="right", padx=6)
         e.bind("<KeyRelease>", lambda ev: self.refresh_table())
@@ -227,6 +290,7 @@ class App(object):
         self.tree.pack(side="left", fill="both", expand=True); vs.pack(side="right", fill="y")
         self.tree.tag_configure("trunc", background="#f8d7da")
         self.tree.tag_configure("imaging", background="#fff3cd")
+        self.tree.bind("<Double-1>", lambda e: self.show_log_graph())
 
         if not _ENGINE_OK:
             self.status.config(text="שגיאת מנוע: " + _ENGINE_ERR)
@@ -391,6 +455,227 @@ class App(object):
                 w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(sess)
             messagebox.showinfo("הושלם", "נשמר:\n" + out)
         ttk.Button(win, text="ייצא sessions ל-CSV", command=exp_sess).pack(pady=4)
+
+    # ---------- גרפיקה (matplotlib) ----------
+    def _need_mpl(self):
+        if not _MPL_OK:
+            messagebox.showwarning("גרפיקה לא זמינה", "matplotlib לא מותקן בגרסה זו.")
+            return False
+        if not self.rows:
+            messagebox.showinfo("מידע", "עדיין לא בוצע ניתוח.")
+            return False
+        return True
+
+    def _fig_window(self, title, figsize=(9, 6)):
+        win = tk.Toplevel(self.master)
+        win.title(title)
+        fig = Figure(figsize=figsize, dpi=100)
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(canvas, win).update()
+        return win, fig, canvas
+
+    def _tx_rows(self):
+        """Filtered treatment logs (non-imaging, error-free)."""
+        return [r for r in self._filtered()
+                if not r.get("is_imaging") and not r.get("error")]
+
+    def _selected_row(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        fn = self.tree.set(sel[0], "filename")
+        for r in self.rows:
+            if r.get("filename") == fn:
+                return r
+        return None
+
+    def show_histograms(self):
+        if not self._need_mpl():
+            return
+        import numpy as np
+        rows = self._tx_rows()
+        if not rows:
+            messagebox.showinfo("מידע", "אין לוגי טיפול להצגה."); return
+        specs = [("mlc_rms_max_mm", "MLC RMS max (mm)"),
+                 ("mlc_err_max_mm", "MLC error max (mm)"),
+                 ("max_gantry_error_deg", "Gantry error (deg)"),
+                 ("num_beam_holds", "Beam holds")]
+        win, fig, canvas = self._fig_window("התפלגות מדדים", (10, 7))
+        for i, (key, label) in enumerate(specs, 1):
+            ax = fig.add_subplot(2, 2, i)
+            vals = [r[key] for r in rows if isinstance(r.get(key), (int, float))]
+            if not vals:
+                ax.set_title(label + " (אין נתונים)"); continue
+            arr = np.asarray(vals, float)
+            counts, bins, patches = ax.hist(arr, bins=40, color="#4e79a7")
+            mu, sd = float(arr.mean()), float(arr.std())
+            thr = CLINICAL.get(key)
+            cut = max(mu + 3 * sd, thr if thr is not None else mu + 3 * sd)
+            for p, b in zip(patches, bins[:-1]):
+                if b >= cut:
+                    p.set_facecolor("#e15759")
+            ax.axvline(mu + 3 * sd, color="#e15759", ls="--", lw=1)
+            if thr is not None:
+                ax.axvline(thr, color="#f28e2b", ls=":", lw=1)
+            n_out = int((arr > cut).sum())
+            ax.set_title("{0}\nmean {1:.3g} · max {2:.3g} · חריגים {3}".format(
+                label, mu, float(arr.max()), n_out), fontsize=9)
+        fig.suptitle("התפלגות על {0} לוגי טיפול  (אדום = זנב חריג)".format(len(rows)))
+        fig.tight_layout(); canvas.draw()
+
+    def show_trend(self):
+        if not self._need_mpl():
+            return
+        import numpy as np
+        rows = [r for r in self._tx_rows() if r.get("_dt")]
+        if not rows:
+            messagebox.showinfo("מידע", "אין חותמות זמן בשמות הקבצים."); return
+        rows.sort(key=lambda r: r["_dt"])
+        dts = [r["_dt"] for r in rows]
+        rms = [r.get("mlc_rms_max_mm") for r in rows]
+        good = [v for v in rms if isinstance(v, (int, float))]
+        mu = float(np.mean(good)); sd = float(np.std(good)); cut = mu + 3 * sd
+        win, fig, canvas = self._fig_window("מגמה לאורך זמן", (10, 6))
+        ax = fig.add_subplot(111)
+        colors = ["#e15759" if isinstance(v, (int, float)) and v > cut else "#4e79a7" for v in rms]
+        ax.scatter(dts, rms, c=colors, s=12)
+        ax.axhline(cut, color="#e15759", ls="--", lw=1, label="mean+3σ ({0:.3g})".format(cut))
+        ax.set_ylabel("MLC RMS max (mm)"); ax.set_xlabel("תאריך")
+        ax.set_title("מגמת MLC RMS על {0} לוגי טיפול".format(len(rows)))
+        ax.legend(); fig.autofmt_xdate(); fig.tight_layout(); canvas.draw()
+
+    def show_log_graph(self):
+        if not _MPL_OK:
+            messagebox.showwarning("גרפיקה לא זמינה", "matplotlib לא מותקן."); return
+        r = self._selected_row()
+        if not r:
+            messagebox.showinfo("בחר לוג", "בחר שורה בטבלה (לחיצה כפולה, או בחר ואז 'גרף לוג')."); return
+        if r.get("error") or not r.get("_path"):
+            messagebox.showwarning("שגיאה", "לוג זה לא נטען בהצלחה."); return
+        import numpy as np
+        try:
+            log = TB.load_log(r["_path"])
+        except Exception as e:
+            messagebox.showerror("שגיאה", str(e)); return
+        t = np.arange(log.num_snapshots) * log.sampling_interval_ms / 1000.0
+        win, fig, canvas = self._fig_window("גרף לוג: " + r.get("filename", "")[:48], (10, 8))
+        ax1 = fig.add_subplot(3, 1, 1)
+        if not r.get("is_imaging") and "mlc" in log.axes:
+            ts, mean_e, max_e = TB.mlc_error_series(log)
+            ax1.plot(ts, max_e, color="#e15759", lw=0.8, label="max")
+            ax1.plot(ts, mean_e, color="#4e79a7", lw=0.8, label="mean")
+            ax1.set_ylabel("MLC error (mm)"); ax1.legend(loc="upper right", fontsize=8)
+        else:
+            ax1.set_title("לוג הדמיה - אין נתוני MLC")
+        ax2 = fig.add_subplot(3, 1, 2, sharex=ax1)
+        if "gantry" in log.axes:
+            ge, ga = log.axes["gantry"]
+            ax2.plot(t, ga, color="#59a14f", lw=0.8, label="actual")
+            ax2.plot(t, ge, color="#999999", lw=0.8, ls="--", label="expected")
+            ax2.set_ylabel("Gantry (deg)"); ax2.legend(loc="upper right", fontsize=8)
+        ax3 = fig.add_subplot(3, 1, 3, sharex=ax1)
+        if "mu" in log.axes:
+            _, mu_a = log.axes["mu"]
+            ax3.plot(t, mu_a, color="#4e79a7", lw=0.9)
+            ax3.set_ylabel("MU"); ax3.set_xlabel("זמן (ש')")
+        if "beam_hold" in log.axes:
+            _, bh = log.axes["beam_hold"]
+            hold = bh.astype(int) == 2
+            for ax in (ax1, ax2, ax3):
+                lo, hi = ax.get_ylim()
+                ax.fill_between(t, lo, hi, where=hold, color="#ffd9a0", alpha=0.5, step="mid")
+                ax.set_ylim(lo, hi)
+        fig.suptitle("מטופל {0}  |  שדה {1}  |  {2}  |  holds מוצללים".format(
+            r.get("patient_id", ""), r.get("beam_name", ""), r.get("energy", "")))
+        fig.tight_layout(); canvas.draw()
+
+    def show_outliers(self):
+        if not self.rows:
+            messagebox.showinfo("מידע", "עדיין לא בוצע ניתוח."); return
+        import statistics
+        from collections import defaultdict
+        rows = self._tx_rows()
+        if not rows:
+            messagebox.showinfo("מידע", "אין לוגי טיפול."); return
+        stats = cohort_stats(self.rows)
+        flagged = []
+        for r in rows:
+            score, reasons = flag_log(r, stats)
+            if reasons:
+                flagged.append((score, r, reasons))
+        flagged.sort(key=lambda x: -x[0])
+        flagged_ids = set(id(r) for _, r, _ in flagged)
+
+        win = tk.Toplevel(self.master); win.title("Outliers / per-patient"); win.geometry("1000x660")
+        ttk.Label(win, font=("Helvetica", 12, "bold"),
+                  text="{0} לוגים מסומנים מתוך {1} לוגי טיפול".format(len(flagged), len(rows))).pack(pady=(6, 0))
+        ttk.Label(win, foreground="#a02040", font=("Helvetica", 9),
+                  text="דגלים מכניים בלבד (MLC/גנטרי/סורגים/MU) — מועמדים לאי-דיוק. "
+                       "אישור דוזימטרי מצריך מדידה (ArcCHECK).").pack()
+        nb = ttk.Notebook(win); nb.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # --- tab 1: flagged logs ---
+        t1 = ttk.Frame(nb); nb.add(t1, text="לוגים מסומנים")
+        cols = ["score", "date", "patient_id", "beam_name", "mlc_rms_max_mm", "mu_diff_pct", "reasons"]
+        tv = ttk.Treeview(t1, columns=cols, show="headings")
+        for c, w in zip(cols, [55, 90, 80, 90, 85, 75, 380]):
+            tv.heading(c, text=c); tv.column(c, width=w, anchor="center")
+        tv.column("reasons", anchor="w")
+        vs = ttk.Scrollbar(t1, orient="vertical", command=tv.yview); tv.configure(yscrollcommand=vs.set)
+        tv.pack(side="left", fill="both", expand=True); vs.pack(side="right", fill="y")
+        for score, r, reasons in flagged:
+            d = r["_dt"].date().isoformat() if r.get("_dt") else ""
+            tv.insert("", "end", values=[score, d, r.get("patient_id"), r.get("beam_name"),
+                                         r.get("mlc_rms_max_mm"), r.get("mu_diff_pct"), "; ".join(reasons)])
+
+        # --- tab 2: per-patient rollup ---
+        t2 = ttk.Frame(nb); nb.add(t2, text="לפי מטופל")
+        bypat = defaultdict(list)
+        for r in rows:
+            bypat[r.get("patient_id")].append(r)
+        pcols = ["patient_id", "n_fx", "mlc_rms_mean", "mlc_rms_max", "n_flagged"]
+        ptv = ttk.Treeview(t2, columns=pcols, show="headings")
+        for c, w in zip(pcols, [110, 60, 120, 120, 90]):
+            ptv.heading(c, text=c); ptv.column(c, width=w, anchor="center")
+        vs2 = ttk.Scrollbar(t2, orient="vertical", command=ptv.yview); ptv.configure(yscrollcommand=vs2.set)
+        ptv.pack(side="left", fill="both", expand=True); vs2.pack(side="right", fill="y")
+        prows = []
+        for pid, rs in bypat.items():
+            vals = [r["mlc_rms_max_mm"] for r in rs if isinstance(r.get("mlc_rms_max_mm"), (int, float))]
+            nfl = sum(1 for r in rs if id(r) in flagged_ids)
+            prows.append((pid, len(rs), round(statistics.mean(vals), 4) if vals else "",
+                          round(max(vals), 4) if vals else "", nfl))
+        prows.sort(key=lambda x: (-x[4], -(x[3] if isinstance(x[3], float) else 0)))
+        for pr in prows:
+            ptv.insert("", "end", values=pr)
+
+        # --- tab 3: bar chart of top outliers ---
+        if _MPL_OK and flagged:
+            t3 = ttk.Frame(nb); nb.add(t3, text="גרף")
+            fig = Figure(figsize=(9, 5), dpi=100); ax = fig.add_subplot(111)
+            top = flagged[:20]
+            labels = [(f[1].get("patient_id", "") + " " +
+                       (f[1]["_dt"].date().isoformat() if f[1].get("_dt") else "")) for f in top]
+            ax.barh(range(len(top)), [f[0] for f in top], color="#e15759")
+            ax.set_yticks(range(len(top))); ax.set_yticklabels(labels, fontsize=7)
+            ax.invert_yaxis(); ax.set_xlabel("score"); ax.set_title("עד 20 הלוגים החריגים ביותר")
+            c = FigureCanvasTkAgg(fig, master=t3); c.get_tk_widget().pack(fill="both", expand=True)
+            NavigationToolbar2Tk(c, t3).update(); fig.tight_layout(); c.draw()
+
+        def exp_csv():
+            folder = os.path.dirname(self.out_csv) if self.out_csv else self.folder.get()
+            out = os.path.join(folder, "outliers.csv")
+            with open(out, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(["score", "date", "patient_id", "beam_name", "mlc_rms_max_mm",
+                            "mu_diff_pct", "reasons"])
+                for score, r, reasons in flagged:
+                    d = r["_dt"].date().isoformat() if r.get("_dt") else ""
+                    w.writerow([score, d, r.get("patient_id"), r.get("beam_name"),
+                                r.get("mlc_rms_max_mm"), r.get("mu_diff_pct"), "; ".join(reasons)])
+            messagebox.showinfo("הושלם", "נשמר:\n" + out)
+        ttk.Button(win, text="ייצא outliers ל-CSV", command=exp_csv).pack(pady=4)
 
     def _open(self, path):
         try:

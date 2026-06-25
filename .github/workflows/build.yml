@@ -25,10 +25,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy openpyxl pyinstaller
+          pip install numpy matplotlib openpyxl pyinstaller
 
       - name: Build TrajectoryLogQA.exe
-        run: pyinstaller --onefile --windowed --name TrajectoryLogQA --collect-all numpy trj_gui.py
+        run: pyinstaller --onefile --windowed --name TrajectoryLogQA --collect-all numpy --collect-all matplotlib trj_gui.py
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress

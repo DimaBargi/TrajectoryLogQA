@@ -17,7 +17,7 @@ if errorlevel 1 goto :err
 echo.
 echo [2/2] בונה את התוכנה עם PyInstaller...
 pyinstaller --onefile --windowed --clean --name TrajectoryLogQA ^
-  --collect-all numpy ^
+  --collect-all numpy --collect-all matplotlib ^
   trj_gui.py
 if errorlevel 1 goto :err
 
