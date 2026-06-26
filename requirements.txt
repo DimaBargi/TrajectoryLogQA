@@ -2,4 +2,5 @@
 numpy>=1.23
 matplotlib>=3.6
 openpyxl>=3.0
+pdfminer.six>=20220319
 pyinstaller>=6.0

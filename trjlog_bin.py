@@ -204,6 +204,108 @@ def mlc_error_series(log: TrajectoryLog):
     return t, err.mean(axis=1), err.max(axis=1)
 
 
+def reconstruct_fluence(log: TrajectoryLog, which: str = "actual", res_mm: float = 1.0):
+    """Reconstruct the (num_pairs x 400/res) fluence map from the log.
+
+    Faithful pure-numpy port of pylinac FluenceBase.calc_map (default
+    equal_aspect=False): each row = one MLC leaf pair, x = position across the
+    40 cm head opening; deposit per-snapshot MU into the open jaw-clipped x-range.
+    Jaws are ALWAYS the actual jaws (matches pylinac). `which` selects actual or
+    expected leaf+MU. Validated to reproduce pylinac maps & gamma.
+    """
+    width = int(round(400 / res_mm))
+    offset = int(round(200 / res_mm))
+    mlc_exp, mlc_act = log.axes["mlc"]                  # (N, 122)
+    mlc = mlc_exp if which == "expected" else mlc_act
+    npairs = (mlc.shape[1] - 2) // 2                     # 60 leaf PAIRS (120 leaves + 2 carriages)
+    mu_e, mu_a = log.axes["mu"]
+    mu = (mu_e if which == "expected" else mu_a).astype(float)
+    if mu.size == 0 or float(np.max(mu)) < 0.5:
+        return np.zeros((npairs, width))
+    mu_diff = np.empty_like(mu)
+    mu_diff[0] = mu[0]
+    mu_diff[1:] = np.diff(mu)
+    x1 = log.axes["x1"][1].astype(float)                # actual jaws
+    x2 = log.axes["x2"][1].astype(float)
+    left_jaw = np.round(offset - x1 * 10.0 / res_mm).astype(int)
+    right_jaw = np.round(x2 * 10.0 / res_mm + offset).astype(int)
+    leaves = mlc[:, 2:]                                  # drop 2 carriages -> (N,120)
+    right_leaf = leaves[:, 0:npairs]                    # bank B (X2 side)
+    left_leaf = leaves[:, npairs:2 * npairs]            # bank A (X1 side)
+    right_px = np.round(right_leaf * 10.0 / res_mm) + offset
+    left_px = -np.round(left_leaf * 10.0 / res_mm) + offset
+    fluence = np.zeros((npairs, width))
+    for p in range(npairs):
+        le = np.clip(np.maximum(left_px[:, p], left_jaw), 0, width).astype(int)
+        re = np.clip(np.minimum(right_px[:, p], right_jaw), 0, width).astype(int)
+        valid = re > le
+        if not valid.any():
+            continue
+        diff = np.zeros(width + 1)
+        np.add.at(diff, le[valid], mu_diff[valid])
+        np.add.at(diff, re[valid], -mu_diff[valid])
+        fluence[p] = np.cumsum(diff[:width])
+    return fluence
+
+
+def _sobel(a, axis):
+    """scipy.ndimage.sobel equivalent (deriv [-1,0,1] along axis, smooth [1,2,1]
+    across), reflect edges. Pure numpy."""
+    def corr3(arr, w, ax):
+        pad = [(0, 0), (0, 0)]
+        pad[ax] = (1, 1)
+        ap = np.pad(arr, pad, mode="reflect")
+        out = np.zeros_like(arr, dtype=float)
+        for k, wk in enumerate(w):
+            sl = [slice(None), slice(None)]
+            sl[ax] = slice(k, k + arr.shape[ax])
+            out += wk * ap[tuple(sl)]
+        return out
+    other = 0 if axis == 1 else 1
+    return corr3(corr3(a.astype(float), [-1.0, 0.0, 1.0], axis), [1.0, 2.0, 1.0], other)
+
+
+def fluence_gamma(log: TrajectoryLog, dose_pct: float = 2.0, dist_mm: float = 2.0,
+                  threshold: float = 0.1, res_mm: float = 1.0):
+    """2-D gamma (actual vs expected fluence), Bakai et al. eq.6 — pure-numpy port
+    of pylinac's gamma. Returns dict: pass_pct, avg_gamma, gamma_map, diff_map.
+    The dosimetric measure of whether delivery deviations mattered. On-demand."""
+    exp = reconstruct_fluence(log, "expected", res_mm)
+    act = reconstruct_fluence(log, "actual", res_mm)
+    if float(exp.max()) <= 0:
+        return None
+    ref = exp - exp.min(); ref = ref / ref.max()        # ground + normalize
+    comp = act - act.min(); comp = comp / comp.max()
+    grad = np.hypot(_sobel(ref, 1), _sobel(ref, 0))
+    distTA_px = (1.0 / res_mm) * dist_mm
+    denom = np.sqrt((dose_pct / 100.0) ** 2 + (distTA_px ** 2) * (grad ** 2))
+    gamma = np.abs(comp - ref) / denom
+    gamma[ref < threshold * ref.max()] = np.nan          # exclude low-dose
+    valid = ~np.isnan(gamma)
+    total = int(valid.sum())
+    pass_pct = (float(np.sum(gamma[valid] < 1)) / total * 100.0) if total else 100.0
+    avg = float(np.nanmean(gamma)) if total else 0.0
+    return {"pass_pct": round(pass_pct, 3), "avg_gamma": round(avg, 4),
+            "gamma_map": np.nan_to_num(gamma), "diff_map": comp - ref,
+            "actual": act, "expected": exp}
+
+
+def fluence_difference(log: TrajectoryLog):
+    """Dosimetric-impact of delivery deviations: actual vs expected fluence.
+
+    Returns flu_err_pct (integral |Δ| / integral expected, %) and
+    flu_max_local_pct (peak local |Δ| / peak expected, %). Fast — for every log."""
+    exp = reconstruct_fluence(log, "expected")
+    act = reconstruct_fluence(log, "actual")
+    s = float(exp.sum())
+    if s <= 0:
+        return {"flu_err_pct": "", "flu_max_local_pct": ""}
+    err = np.abs(act - exp)
+    mx = float(exp.max()) or 1.0
+    return {"flu_err_pct": round(float(err.sum()) / s * 100.0, 4),
+            "flu_max_local_pct": round(float(err.max()) / mx * 100.0, 4)}
+
+
 def qa_metrics(log: TrajectoryLog) -> dict:
     """Standard delivery-QA metrics, all from the raw axis data (no pylinac)."""
     m: dict = {
@@ -251,6 +353,8 @@ def qa_metrics(log: TrajectoryLog) -> dict:
         m["mlc_rms_max_mm"] = round(float(np.max(rms)) * 10, 4)
         m["mlc_err_p95_mm"] = round(float(np.percentile(err, 95)) * 10, 4)
         m["mlc_err_max_mm"] = round(float(np.max(err)) * 10, 4)
+        # mean SIGNED leaf error (bias) — for systematic-vs-random across fractions
+        m["mlc_bias_mm"] = round(float(np.mean(act - exp)) * 10, 4)
     # mechanical axis max errors
     for ax, key, scale in [("gantry", "max_gantry_error_deg", 1),
                            ("collimator", "max_collimator_error_deg", 1)]:
@@ -271,4 +375,15 @@ def qa_metrics(log: TrajectoryLog) -> dict:
         m["beam_hold_fraction"] = round(float(np.mean(holds)), 4)
     # beam-on time = expected irradiation time of subbeams (radTime)
     m["beam_on_s"] = round(sum(sb.rad_time for sb in log.subbeams), 2)
+    # dosimetric impact of delivery deviations: actual vs expected fluence.
+    # The sensitive, continuous danger metric (gamma is usually 100% — too coarse).
+    if not is_imaging and "mlc" in log.axes:
+        try:
+            m.update(fluence_difference(log))
+        except Exception:  # noqa: BLE001
+            m["flu_err_pct"] = ""
+            m["flu_max_local_pct"] = ""
+    else:
+        m["flu_err_pct"] = ""
+        m["flu_max_local_pct"] = ""
     return m

@@ -14,6 +14,7 @@ from __future__ import print_function
 
 import csv
 import os
+import re
 import sys
 import threading
 from datetime import datetime, timedelta
@@ -50,8 +51,12 @@ try:
 except Exception:
     _MPL_OK = False
 
-# Clinical flag thresholds for "suspect mechanical-delivery accuracy" (editable).
+# Flag thresholds for "suspect delivery accuracy" (editable).
+# flu_* are the DOSIMETRIC-impact metrics (actual-vs-expected fluence) and lead the
+# danger ranking; the rest are the mechanical metrics.
 CLINICAL = {
+    "flu_err_pct": 1.0,           # % integral fluence error (dosimetric, primary)
+    "flu_max_local_pct": 5.0,     # % peak local fluence error
     "mlc_rms_max_mm": 0.5,        # mm
     "mlc_err_max_mm": 1.0,        # mm
     "max_gantry_error_deg": 0.5,  # deg
@@ -60,6 +65,105 @@ CLINICAL = {
 }
 Z_THRESHOLD = 3.0                 # statistical outlier: z > 3 vs the cohort
 FLAG_METRICS = list(CLINICAL.keys())
+# QA (ArcCHECK) action limit — a measured gamma below this is a real dosimetric fail.
+QA_ACTION_LIMIT = 90.0
+QA_MATCH_DAYS = 4                 # match a log to a QA measurement within ±N days
+
+try:
+    from pdfminer.converter import PDFPageAggregator
+    from pdfminer.layout import LAParams, LTChar, LTTextContainer
+    from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
+    from pdfminer.pdfpage import PDFPage
+    _PDFMINER_OK = True
+except Exception:
+    _PDFMINER_OK = False
+
+
+def _qa_layout(pdf_path):
+    """Reconstruct visual rows of a QA PDF by y-grouping (same as MPC/GammaQA)."""
+    rsrcmgr = PDFResourceManager()
+    device = PDFPageAggregator(rsrcmgr, laparams=LAParams())
+    interp = PDFPageInterpreter(rsrcmgr, device)
+    out = []
+    with open(pdf_path, "rb") as fp:
+        for page in PDFPage.get_pages(fp):
+            interp.process_page(page)
+            chars = []
+
+            def walk(o):
+                for c in o:
+                    if isinstance(c, LTChar):
+                        chars.append(c)
+                    elif isinstance(c, LTTextContainer):
+                        walk(c)
+            walk(device.get_result())
+            rows = {}
+            for c in chars:
+                rows.setdefault(int(round(c.y0 / 3.0)), []).append(c)
+            for k in sorted(rows, reverse=True):
+                out.append("".join(ch.get_text() for ch in sorted(rows[k], key=lambda c: c.x0)))
+    return "\n".join(out)
+
+
+def _qa_parse(text):
+    """Extract (patient_id, date, percent_passed, device) from a QA report."""
+    import datetime as _dt
+    pid = re.search(r"Patient\s*ID\s*:?\s*(\S+)", text)
+    pct = re.search(r"%\s*Passed\s*:?\s*([0-9.]+)", text)
+    # Prefer "Plan Date" (M/D/YYYY); the header "Date:" is D/M/YYYY and ambiguous.
+    dm = re.search(r"Plan\s*Date\s*:?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})", text)
+    dev = "ArcCHECK" if "ArcCHECK" in text[:800] else ("MapCHECK" if "MapCHECK" in text[:800] else "")
+    date = None
+    if dm:
+        try:
+            date = _dt.datetime.strptime(dm.group(1), "%m/%d/%Y").date()
+        except ValueError:
+            date = None
+    return {"patient_id": pid.group(1) if pid else "",
+            "date": date, "percent_passed": float(pct.group(1)) if pct else None,
+            "device": dev}
+
+
+def load_qa_folder(folder, progress_cb):
+    """Parse all QA PDFs in a folder → list of measurement dicts."""
+    pdfs = []
+    for dp, _, fns in os.walk(folder):
+        for fn in fns:
+            if fn.lower().endswith(".pdf"):
+                pdfs.append(os.path.join(dp, fn))
+    pdfs.sort()
+    meas = []
+    for i, p in enumerate(pdfs, 1):
+        progress_cb(i, len(pdfs), os.path.basename(p))
+        try:
+            r = _qa_parse(_qa_layout(p))
+            if r["patient_id"] and r["percent_passed"] is not None:
+                meas.append(r)
+        except Exception:  # noqa: BLE001
+            pass
+    return meas
+
+
+def match_qa(rows, measurements):
+    """Attach measured_gamma_pct to each log row by patient_id + nearest date (±days)."""
+    from collections import defaultdict
+    by_pid = defaultdict(list)
+    for m in measurements:
+        if m["date"]:
+            by_pid[str(m["patient_id"])].append(m)
+    n = 0
+    for r in rows:
+        r["measured_gamma_pct"] = ""
+        dt = r.get("_dt")
+        pid = str(r.get("patient_id", ""))
+        if dt is None or pid not in by_pid:
+            continue
+        ld = dt.date()
+        best = min(by_pid[pid], key=lambda m: abs((m["date"] - ld).days))
+        if abs((best["date"] - ld).days) <= QA_MATCH_DAYS:
+            r["measured_gamma_pct"] = best["percent_passed"]
+            n += 1
+    return n
 
 APP_TITLE = "Davidoff Physics Trajectory Log"
 APP_SUBTITLE = "ניתוח קבצי Trajectory Log (.bin) - TrueBeam"
@@ -67,10 +171,12 @@ APP_SUBTITLE = "ניתוח קבצי Trajectory Log (.bin) - TrueBeam"
 # full output columns (CSV/Excel)
 COLUMNS = ["filename", "patient_id", "plan_name", "beam_name", "energy", "mlc_model",
            "num_snapshots", "sampling_interval_ms", "duration_s", "num_subbeams",
-           "mu_planned", "mu_delivered", "mu_diff_pct", "mlc_rms_avg_mm", "mlc_rms_max_mm",
-           "mlc_err_p95_mm", "mlc_err_max_mm", "max_gantry_error_deg",
+           "mu_planned", "mu_delivered", "mu_diff_pct",
+           "flu_err_pct", "flu_max_local_pct",
+           "mlc_rms_avg_mm", "mlc_rms_max_mm",
+           "mlc_err_p95_mm", "mlc_err_max_mm", "mlc_bias_mm", "max_gantry_error_deg",
            "max_collimator_error_deg", "max_jaw_error_cm", "num_beam_holds",
-           "beam_hold_fraction", "beam_on_s", "is_truncated", "is_imaging",
+           "beam_hold_fraction", "beam_on_s", "measured_gamma_pct", "is_truncated", "is_imaging",
            "plan_uid", "error"]
 
 # columns shown in the on-screen table (key subset)
@@ -80,12 +186,13 @@ TREE_COLS = [
     ("beam_name", "שדה", 90),
     ("energy", "אנרגיה", 70),
     ("duration_s", "משך (ש')", 70),
-    ("mu_delivered", "MU", 70),
-    ("mlc_rms_avg_mm", "MLC RMS", 75),
-    ("mlc_rms_max_mm", "MLC max", 75),
-    ("max_gantry_error_deg", "גנטרי err", 75),
-    ("num_beam_holds", "holds", 55),
-    ("is_truncated", "חתוך", 55),
+    ("mu_delivered", "MU", 65),
+    ("flu_err_pct", "fluence Δ%", 75),
+    ("mlc_rms_max_mm", "MLC max", 70),
+    ("max_gantry_error_deg", "גנטרי err", 70),
+    ("num_beam_holds", "holds", 50),
+    ("measured_gamma_pct", "γ נמדד", 60),
+    ("is_truncated", "חתוך", 50),
 ]
 
 
@@ -271,7 +378,9 @@ class App(object):
         ttk.Button(flt, text="התפלגות", command=self.show_histograms).pack(side="left", padx=2)
         ttk.Button(flt, text="מגמה", command=self.show_trend).pack(side="left", padx=2)
         ttk.Button(flt, text="גרף לוג", command=self.show_log_graph).pack(side="left", padx=2)
+        ttk.Button(flt, text="מפת fluence", command=self.show_fluence).pack(side="left", padx=2)
         ttk.Button(flt, text="outliers / מטופלים", command=self.show_outliers).pack(side="left", padx=2)
+        ttk.Button(flt, text="טען QA (ArcCHECK)", command=self.load_qa).pack(side="left", padx=2)
         ttk.Label(flt, text=":חיפוש").pack(side="right")
         e = ttk.Entry(flt, textvariable=self.search, width=16); e.pack(side="right", padx=6)
         e.bind("<KeyRelease>", lambda ev: self.refresh_table())
@@ -482,11 +591,18 @@ class App(object):
             "אנרגיה      - אנרגיית הקרן (6x, 10x, 10xFFF...)\n"
             "משך (ש')    - משך ההקלטה בשניות (snapshots x 0.02)\n"
             "MU          - מוניטור-יוניטס שנמסרו בפועל\n"
-            "MLC RMS     - שגיאת מיקום עלי MLC, ממוצע RMS (מ\"מ) - כמה העלים דייקו\n"
-            "MLC max     - שגיאת העלה המקסימלית (מ\"מ) - המקרה הקיצוני\n"
+            "fluence Δ%  - הפרש פלואנס נמסר↔מתוכנן (%) = ההשפעה הדוזימטרית [המדד העיקרי]\n"
+            "MLC max     - שגיאת מיקום העלה המקסימלית (מ\"מ) - מכני\n"
             "גנטרי err   - שגיאת זווית הגנטרי המקסימלית (מעלות)\n"
             "holds       - מספר עצירות קרן (gating / מעברי שדה / השהיות)\n"
+            "γ נמדד      - gamma שנמדד ב-ArcCHECK (אחרי 'טען QA') = אמת המנה האמיתית\n"
             "חתוך        - האם הלוג נקטע (טיפול > 20 דק'). True = נתונים חלקיים\n\n"
+            "מה באמת מסוכן?\n--------------\n"
+            "fluence Δ% (דוזימטרי) מוביל את הדירוג - הוא אומר אם הסטייה המכנית\n"
+            "באמת שינתה את הפלואנס/מנה. 'מפת fluence' מראה איפה על השדה.\n"
+            "systematic (בלוח מטופלים) = הטיית עלים עקבית בין פרקציות -\n"
+            "מצטברת לאורך הקורס, מסוכנת יותר מרעש אקראי.\n"
+            "γ נמדד מתחת ל-90% = כשל דוזימטרי אמיתי במדידה.\n\n"
             "צבעי שורות\n----------\n"
             "לבן  - לוג טיפול תקין ומלא\n"
             "צהוב - לוג הדמיה (kV/CBCT/setup) - אין MLC/מנה\n"
@@ -494,6 +610,7 @@ class App(object):
             "גבולות לדגל \"חשוד לאי-דיוק\"\n---------------------------\n"
             "התוכנה מדגלת לוג בשתי דרכים:\n\n"
             "1) ספים קליניים קבועים (מבוסס MPPG 8.b / TG-142):\n"
+            "   fluence Δ > {flu:g}%  (דוזימטרי, עיקרי)\n"
             "   MLC RMS   > {rms:g} מ\"מ\n"
             "   MLC max   > {emax:g} מ\"מ\n"
             "   גנטרי err > {gan:g} מעלות\n"
@@ -507,7 +624,7 @@ class App(object):
             "הדגלים מודדים דיוק *מכני* (MLC/גנטרי/סורגים/MU) - מועמדים לאי-דיוק\n"
             "במנה. אישור דוזימטרי מצריך מדידה (ArcCHECK). הלוג אינו רואה שגיאות\n"
             "מודל-מנה ב-TPS או סחף כיול/פלט של המאיץ.\n"
-        ).format(rms=c["mlc_rms_max_mm"], emax=c["mlc_err_max_mm"],
+        ).format(flu=c["flu_err_pct"], rms=c["mlc_rms_max_mm"], emax=c["mlc_err_max_mm"],
                  gan=c["max_gantry_error_deg"], jaw=c["max_jaw_error_cm"] * 10,
                  mu=c["mu_diff_pct"])
         txt.insert("1.0", content)
@@ -650,6 +767,68 @@ class App(object):
             r.get("patient_id", ""), r.get("beam_name", ""), r.get("energy", "")))
         fig.tight_layout(); canvas.draw()
 
+    def show_fluence(self):
+        if not _MPL_OK:
+            messagebox.showwarning("גרפיקה לא זמינה", "matplotlib לא מותקן."); return
+        r = self._selected_row()
+        if not r:
+            messagebox.showinfo("בחר לוג", "בחר שורה בטבלה (לוג טיפול)."); return
+        if r.get("error") or not r.get("_path") or r.get("is_imaging"):
+            messagebox.showwarning("לא זמין", "מפת fluence זמינה ללוגי טיפול בלבד."); return
+        try:
+            log = TB.load_log(r["_path"])
+            g = TB.fluence_gamma(log, dose_pct=2, dist_mm=2, threshold=0.1)
+        except Exception as e:
+            messagebox.showerror("שגיאה", str(e)); return
+        if not g:
+            messagebox.showinfo("מידע", "אין fluence (לוג הדמיה?)."); return
+        win, fig, canvas = self._fig_window("מפת fluence: " + r.get("filename", "")[:42], (11, 7))
+        panels = [(g["actual"], "Actual (נמסר)", "viridis"),
+                  (g["expected"], "Expected (מתוכנן)", "viridis"),
+                  (g["diff_map"], "Difference act-exp", "RdBu_r"),
+                  (g["gamma_map"], "Gamma 2%/2mm", "inferno")]
+        for i, (arr, title, cmap) in enumerate(panels, 1):
+            ax = fig.add_subplot(2, 2, i)
+            im = ax.imshow(arr, aspect="auto", cmap=cmap)
+            ax.set_title(title, fontsize=9)
+            ax.set_xlabel("x (mm)", fontsize=7); ax.set_ylabel("leaf pair", fontsize=7)
+            fig.colorbar(im, ax=ax, fraction=0.046)
+        fig.suptitle("מטופל {0} | gamma pass {1}% | fluence Δ {2}%  (השוואת נמסר↔מתוכנן מהלוג)".format(
+            r.get("patient_id", ""), g["pass_pct"], r.get("flu_err_pct", "")))
+        fig.tight_layout(); canvas.draw()
+
+    def load_qa(self):
+        if not self.rows:
+            messagebox.showinfo("מידע", "קודם הרץ ניתוח לוגים."); return
+        if not _PDFMINER_OK:
+            messagebox.showwarning("לא זמין", "pdfminer לא מותקן בגרסה זו."); return
+        folder = filedialog.askdirectory(title="בחר תיקיית דוחות QA (ArcCHECK PDF)")
+        if not folder:
+            return
+        win = tk.Toplevel(self.master); win.title("טוען QA..."); win.geometry("440x90")
+        lbl = ttk.Label(win, text="טוען דוחות QA..."); lbl.pack(pady=8)
+        pb = ttk.Progressbar(win, mode="determinate"); pb.pack(fill="x", padx=10)
+
+        def prog(d, t, m):
+            self.master.after(0, lambda: (pb.configure(maximum=t, value=d),
+                                          lbl.configure(text="QA {0}/{1}".format(d, t))))
+
+        def work():
+            try:
+                meas = load_qa_folder(folder, prog)
+                n = match_qa(self.rows, meas)
+                self.master.after(0, lambda: self._qa_done(win, len(meas), n))
+            except Exception as e:
+                self.master.after(0, lambda: (win.destroy(), messagebox.showerror("שגיאה", str(e))))
+        th = threading.Thread(target=work); th.daemon = True; th.start()
+
+    def _qa_done(self, win, nmeas, nmatch):
+        win.destroy()
+        self.refresh_table()
+        messagebox.showinfo("QA נטען",
+                            "נטענו {0} מדידות QA; הותאמו ל-{1} לוגים.\n"
+                            "פתח 'outliers / מטופלים' לתצוגת חזוי-מול-נמדד.".format(nmeas, nmatch))
+
     def show_outliers(self):
         if not self.rows:
             messagebox.showinfo("מידע", "עדיין לא בוצע ניתוח."); return
@@ -677,9 +856,9 @@ class App(object):
 
         # --- tab 1: flagged logs ---
         t1 = ttk.Frame(nb); nb.add(t1, text="לוגים מסומנים")
-        cols = ["score", "date", "patient_id", "beam_name", "mlc_rms_max_mm", "mu_diff_pct", "reasons"]
+        cols = ["score", "date", "patient_id", "beam_name", "flu_err_pct", "measured_γ", "reasons"]
         tv = ttk.Treeview(t1, columns=cols, show="headings")
-        for c, w in zip(cols, [55, 90, 80, 90, 85, 75, 380]):
+        for c, w in zip(cols, [55, 85, 80, 85, 80, 80, 360]):
             tv.heading(c, text=c); tv.column(c, width=w, anchor="center")
         tv.column("reasons", anchor="w")
         vs = ttk.Scrollbar(t1, orient="vertical", command=tv.yview); tv.configure(yscrollcommand=vs.set)
@@ -687,28 +866,42 @@ class App(object):
         for score, r, reasons in flagged:
             d = r["_dt"].date().isoformat() if r.get("_dt") else ""
             tv.insert("", "end", values=[score, d, r.get("patient_id"), r.get("beam_name"),
-                                         r.get("mlc_rms_max_mm"), r.get("mu_diff_pct"), "; ".join(reasons)])
+                                         r.get("flu_err_pct"), r.get("measured_gamma_pct", ""),
+                                         "; ".join(reasons)])
 
         # --- tab 2: per-patient rollup ---
         t2 = ttk.Frame(nb); nb.add(t2, text="לפי מטופל")
         bypat = defaultdict(list)
         for r in rows:
             bypat[r.get("patient_id")].append(r)
-        pcols = ["patient_id", "n_fx", "mlc_rms_mean", "mlc_rms_max", "n_flagged"]
+        pcols = ["patient_id", "n_fx", "flu_err_mean", "systematic", "n_flagged", "measured_γ_min"]
         ptv = ttk.Treeview(t2, columns=pcols, show="headings")
-        for c, w in zip(pcols, [110, 60, 120, 120, 90]):
+        for c, w in zip(pcols, [110, 55, 105, 90, 80, 110]):
             ptv.heading(c, text=c); ptv.column(c, width=w, anchor="center")
         vs2 = ttk.Scrollbar(t2, orient="vertical", command=ptv.yview); ptv.configure(yscrollcommand=vs2.set)
         ptv.pack(side="left", fill="both", expand=True); vs2.pack(side="right", fill="y")
         prows = []
         for pid, rs in bypat.items():
-            vals = [r["mlc_rms_max_mm"] for r in rs if isinstance(r.get("mlc_rms_max_mm"), (int, float))]
+            flu = [r["flu_err_pct"] for r in rs if isinstance(r.get("flu_err_pct"), (int, float))]
+            bias = [r["mlc_bias_mm"] for r in rs if isinstance(r.get("mlc_bias_mm"), (int, float))]
+            mg = [r["measured_gamma_pct"] for r in rs if isinstance(r.get("measured_gamma_pct"), (int, float))]
             nfl = sum(1 for r in rs if id(r) in flagged_ids)
-            prows.append((pid, len(rs), round(statistics.mean(vals), 4) if vals else "",
-                          round(max(vals), 4) if vals else "", nfl))
-        prows.sort(key=lambda x: (-x[4], -(x[3] if isinstance(x[3], float) else 0)))
+            # systematic ratio: |mean bias| / std(bias). High + consistent sign = systematic
+            # (accumulates across the course = more dangerous than random jitter)
+            if len(bias) >= 2:
+                mb = statistics.mean(bias); sb = statistics.pstdev(bias) or 1e-9
+                sysr = round(abs(mb) / sb, 2)
+            else:
+                sysr = ""
+            prows.append((pid, len(rs), round(statistics.mean(flu), 4) if flu else "",
+                          sysr, nfl, round(min(mg), 1) if mg else ""))
+        prows.sort(key=lambda x: (-x[4], -(x[2] if isinstance(x[2], float) else 0)))
         for pr in prows:
-            ptv.insert("", "end", values=pr)
+            tags = ("sysflag",) if (isinstance(pr[3], float) and pr[3] > 1.5) else ()
+            ptv.insert("", "end", values=pr, tags=tags)
+        ptv.tag_configure("sysflag", background="#ffe0b0")
+        ttk.Label(t2, font=("Helvetica", 8), foreground="#a05000",
+                  text="systematic > 1.5 (כתום) = הטיית עלים עקבית בין פרקציות = מצטברת לאורך הקורס").pack(side="bottom")
 
         # --- tab 3: bar chart of top outliers ---
         if _MPL_OK and flagged:
