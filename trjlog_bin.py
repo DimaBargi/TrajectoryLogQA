@@ -306,6 +306,69 @@ def fluence_difference(log: TrajectoryLog):
             "flu_max_local_pct": round(float(err.max()) / mx * 100.0, 4)}
 
 
+def complexity_metrics(log: TrajectoryLog):
+    """Log-derived plan-complexity metrics (McNiven 2010 MCS proxy + aperture/leaf
+    metrics), MU-weighted over beam-on snapshots. All from the ACTUAL delivery.
+
+    Returns: mcs (0-1, 1=simplest), mean_leaf_gap_mm, sas5_pct (small-aperture
+    fraction <5 mm), mean_leaf_speed_mms, mlc_modulation. Honest proxy: snapshots
+    stand in for control points (continuous log), labeled as log-derived."""
+    if "mlc" not in log.axes or "mu" not in log.axes:
+        return {}
+    exp, act = mlc_leaf_arrays(log)                       # (N,120) cm
+    mask = beam_on_mask(log)
+    leaves = act
+    if mask is not None and mask.any():
+        leaves = act[mask]
+    if leaves.shape[0] < 2:
+        return {}
+    npairs = leaves.shape[1] // 2
+    bankB = leaves[:, 0:npairs]                           # right (X2)
+    bankA = leaves[:, npairs:2 * npairs]                  # left  (X1)
+    gap = np.clip(bankB - bankA, 0, None) * 10.0          # mm, (S,npairs)
+    # MU weight per beam-on snapshot
+    mu = log.axes["mu"][1].astype(float)
+    if mask is not None and mask.any():
+        mu = mu[mask]
+    mu_diff = np.empty_like(mu)
+    mu_diff[0] = 0.0
+    mu_diff[1:] = np.diff(mu)
+    mu_diff = np.clip(mu_diff, 0, None)
+    w = mu_diff / (mu_diff.sum() or 1.0)                  # (S,)
+    open_pairs = gap > 0.1
+    # mean leaf gap (MU-weighted, over open pairs)
+    seg_gap = np.array([gap[s, open_pairs[s]].mean() if open_pairs[s].any() else 0.0
+                        for s in range(gap.shape[0])])
+    mean_leaf_gap = float(np.sum(w * seg_gap))
+    # small-aperture score SAS(5mm): MU-weighted fraction of open pairs with gap<5mm
+    sas = np.array([(gap[s, open_pairs[s]] < 5.0).mean() if open_pairs[s].any() else 0.0
+                    for s in range(gap.shape[0])])
+    sas5 = float(np.sum(w * sas)) * 100.0
+    # AAV: segment open area / per-leaf max open area
+    posmax = gap.max(axis=0)                              # per-leaf max gap
+    denom = float(posmax.sum()) or 1.0
+    aav = gap.sum(axis=1) / denom
+    # LSV per bank: smoothness of adjacent leaf positions
+    def lsv(bank):
+        rng = bank.max(axis=1) - bank.min(axis=1)         # (S,)
+        rng = np.where(rng < 1e-6, 1e-6, rng)
+        d = np.abs(np.diff(bank, axis=1))                 # (S,npairs-1)
+        return np.sum(rng[:, None] - d, axis=1) / ((bank.shape[1] - 1) * rng)
+    lsv_seg = lsv(bankA * 10.0) * lsv(bankB * 10.0)
+    mcs = float(np.sum(w * aav * lsv_seg))
+    # leaf speed (mm/s) over beam-on
+    dt = log.sampling_interval_ms / 1000.0
+    dleaf = np.abs(np.diff(leaves, axis=0)) * 10.0
+    speeds = dleaf / dt
+    mean_speed = float(speeds[speeds > 0].mean()) if (speeds > 0).any() else 0.0
+    # modulation proxy: variability of aperture area
+    area = gap.sum(axis=1)
+    modulation = float(area.std() / (area.mean() + 1e-9))
+    return {"mcs": round(mcs, 4), "mean_leaf_gap_mm": round(mean_leaf_gap, 2),
+            "sas5_pct": round(sas5, 2), "mean_leaf_speed_mms": round(mean_speed, 2),
+            "mlc_modulation": round(modulation, 4)}
+
+
 def qa_metrics(log: TrajectoryLog) -> dict:
     """Standard delivery-QA metrics, all from the raw axis data (no pylinac)."""
     m: dict = {
@@ -383,7 +446,18 @@ def qa_metrics(log: TrajectoryLog) -> dict:
         except Exception:  # noqa: BLE001
             m["flu_err_pct"] = ""
             m["flu_max_local_pct"] = ""
+        # plan-complexity metrics (log-derived) — Tier 2.1
+        try:
+            m.update(complexity_metrics(log))
+        except Exception:  # noqa: BLE001
+            pass
     else:
         m["flu_err_pct"] = ""
         m["flu_max_local_pct"] = ""
+    # gating / beam-hold duty cycle — Tier 1.3 (beam-on fraction = 1 - hold fraction)
+    if "beam_hold" in log.axes:
+        _, bh = log.axes["beam_hold"]
+        if bh.size:
+            on = float(np.mean(bh.astype(int) == 0))
+            m["beam_on_duty_pct"] = round(on * 100.0, 2)
     return m

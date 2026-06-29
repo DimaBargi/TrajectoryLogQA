@@ -91,6 +91,9 @@ SPC_METRICS = [
     ("max_gantry_error_deg", "Gantry error (°)"),
     ("mu_diff_pct", "MU diff (%)"),
     ("num_beam_holds", "Beam holds"),
+    ("mcs", "MCS (complexity)"),
+    ("mean_leaf_gap_mm", "Mean leaf gap (mm)"),
+    ("beam_on_duty_pct", "Beam-on duty (%)"),
 ]
 
 
@@ -323,7 +326,8 @@ COLUMNS = ["filename", "machine", "patient_id", "plan_name", "beam_name", "energ
            "mlc_rms_avg_mm", "mlc_rms_max_mm",
            "mlc_err_p95_mm", "mlc_err_max_mm", "mlc_bias_mm", "max_gantry_error_deg",
            "max_collimator_error_deg", "max_jaw_error_cm", "num_beam_holds",
-           "beam_hold_fraction", "beam_on_s", "measured_gamma_pct",
+           "beam_hold_fraction", "beam_on_s", "beam_on_duty_pct", "measured_gamma_pct",
+           "mcs", "mean_leaf_gap_mm", "sas5_pct", "mean_leaf_speed_mms", "mlc_modulation",
            "fraction", "termination", "operator", "rt_beam_on_s",
            "is_truncated", "is_imaging", "plan_uid", "error"]
 
@@ -340,11 +344,83 @@ TREE_COLS = [
     ("mlc_rms_max_mm", "MLC max", 70),
     ("max_gantry_error_deg", "גנטרי err", 70),
     ("num_beam_holds", "holds", 50),
+    ("mcs", "MCS", 55),
     ("measured_gamma_pct", "γ נמדד", 55),
     ("fraction", "פרקציה", 55),
-    ("termination", "סיום", 80),
+    ("termination", "סיום", 75),
     ("is_truncated", "חתוך", 50),
 ]
+
+
+# ------------------------- persistent history (SQLite) -------------------------
+import sqlite3
+
+_HISTORY_COLS = ["log_date", "machine", "patient_id", "beam_name", "filename",
+                 "energy", "mu_delivered", "flu_err_pct", "mlc_rms_max_mm",
+                 "mlc_err_max_mm", "max_gantry_error_deg", "num_beam_holds",
+                 "mcs", "mean_leaf_gap_mm", "sas5_pct", "measured_gamma_pct",
+                 "is_imaging", "is_truncated"]
+
+
+def history_db_path():
+    return os.path.join(os.path.expanduser("~"), ".trajectorylogqa_history.db")
+
+
+def save_history(rows):
+    """Append/replace this run's rows into the local history DB (dedup by filename
+    + log_date). Lets SPC trends accrue across runs without re-parsing."""
+    path = history_db_path()
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cols_sql = ", ".join("%s" % c for c in _HISTORY_COLS)
+    cur.execute("CREATE TABLE IF NOT EXISTS log_history (%s, "
+                "PRIMARY KEY(filename, log_date))" % cols_sql)
+    n = 0
+    for r in rows:
+        if r.get("error"):
+            continue
+        dt = r.get("_dt")
+        ld = dt.date().isoformat() if dt else ""
+        vals = [ld] + [r.get(c, "") for c in _HISTORY_COLS[1:]]
+        vals = [("" if v is None else v) for v in vals]
+        ph = ", ".join("?" * len(_HISTORY_COLS))
+        cur.execute("INSERT OR REPLACE INTO log_history VALUES (%s)" % ph, vals)
+        n += 1
+    con.commit()
+    con.close()
+    return n
+
+
+def load_history():
+    """Read all history rows back (with _dt reconstructed) for cross-run SPC."""
+    path = history_db_path()
+    if not os.path.exists(path):
+        return []
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        cur = con.execute("SELECT * FROM log_history")
+    except sqlite3.OperationalError:
+        con.close()
+        return []
+    out = []
+    for rr in cur.fetchall():
+        r = dict(rr)
+        try:
+            r["_dt"] = datetime.fromisoformat(r["log_date"]) if r.get("log_date") else None
+        except ValueError:
+            r["_dt"] = None
+        for k in ("flu_err_pct", "mlc_rms_max_mm", "mlc_err_max_mm",
+                  "max_gantry_error_deg", "num_beam_holds", "mcs",
+                  "mean_leaf_gap_mm", "sas5_pct", "measured_gamma_pct", "mu_delivered"):
+            try:
+                r[k] = float(r[k]) if r.get(k) not in ("", None) else ""
+            except (ValueError, TypeError):
+                r[k] = ""
+        r["is_imaging"] = str(r.get("is_imaging")) in ("True", "1")
+        out.append(r)
+    con.close()
+    return out
 
 
 def scan_bin(root):
@@ -588,6 +664,8 @@ class App(object):
         et.bind("<KeyRelease>", lambda ev: self.refresh_table())
         ttk.Button(flt2, text="נקה סינון", command=self._clear_filters).pack(side="left")
         ttk.Button(flt2, text="SPC / בקרת תהליך", command=self.show_spc).pack(side="left", padx=6)
+        ttk.Button(flt2, text="דוח PDF", command=self.export_pdf_report).pack(side="left", padx=2)
+        ttk.Button(flt2, text="היסטוריה", command=self.show_history).pack(side="left", padx=2)
 
         tf = ttk.Frame(self.master); tf.pack(fill="both", expand=True, padx=12, pady=8)
         cols = [c[0] for c in TREE_COLS]
@@ -651,6 +729,10 @@ class App(object):
         self.rows = rows; self.out_csv = out
         n_img = sum(1 for r in rows if r.get("is_imaging"))
         n_tr = sum(1 for r in rows if r.get("is_truncated"))
+        try:
+            save_history(rows)                           # accrue cross-run history
+        except Exception:  # noqa: BLE001
+            pass
         machines = sorted(set(r.get("machine") for r in rows if r.get("machine")))
         self.cb_machine["values"] = ["הכל"] + machines
         self.summary.config(text="לוגים: {0}  |  מאיצים: {1}  |  טיפול: {2}  |  הדמיה: {3}  |  חתוכים: {4}  |  כשלים: {5}".format(
@@ -826,6 +908,7 @@ class App(object):
             "גנטרי err   - שגיאת זווית הגנטרי המקסימלית (מעלות)\n"
             "holds       - מספר עצירות קרן (gating / מעברי שדה / השהיות)\n"
             "γ נמדד      - gamma שנמדד ב-ArcCHECK (אחרי 'טען QA') = אמת המנה האמיתית\n"
+            "MCS         - מדד מורכבות (0-1, נמוך=מורכב יותר); SAS5=שדות קטנים\n"
             "פרקציה      - מספר הפרקציה (אחרי 'טען RTRECORD', מ-ARIA)\n"
             "סיום        - סטטוס סיום הטיפול. NORMAL=תקין; אחר=הפרעה\n"
             "חתוך        - האם הלוג נקטע (טיפול > 20 דק'). True = נתונים חלקיים\n\n"
@@ -1064,6 +1147,96 @@ class App(object):
                 w.writerow([r["_dt"].date().isoformat(), r.get("machine"), r.get("patient_id"),
                             r.get("filename"), v, st, ""])
         messagebox.showinfo("הושלם", "נשמר:\n" + out)
+
+    def export_pdf_report(self):
+        """Multi-page PDF: cohort summary + histograms + SPC chart + outliers list."""
+        if not _MPL_OK:
+            messagebox.showwarning("לא זמין", "matplotlib לא מותקן."); return
+        if not self.rows:
+            messagebox.showinfo("מידע", "עדיין לא בוצע ניתוח."); return
+        from matplotlib.backends.backend_pdf import PdfPages
+        import numpy as np
+        rows = self._filtered()
+        tx = [r for r in rows if not r.get("is_imaging") and not r.get("error")]
+        folder = os.path.dirname(self.out_csv) if self.out_csv else self.folder.get()
+        out = os.path.join(folder, "trajectory_qa_report.pdf")
+        try:
+            with PdfPages(out) as pdf:
+                # page 1: cover + summary text
+                fig = Figure(figsize=(8.3, 11.7)); ax = fig.add_subplot(111); ax.axis("off")
+                machines = sorted(set(r.get("machine") for r in rows if r.get("machine")))
+                dates = sorted(r["_dt"].date().isoformat() for r in rows if r.get("_dt"))
+                span = "%s → %s" % (dates[0], dates[-1]) if dates else "-"
+                lines = [
+                    "Davidoff Physics - Trajectory Log QA Report", "",
+                    "Logs (filtered): %d   |   treatment: %d   |   imaging: %d" % (
+                        len(rows), len(tx), sum(1 for r in rows if r.get("is_imaging"))),
+                    "Machines: %s" % ", ".join(machines), "Date span: %s" % span, "",
+                ]
+                for key, lbl in [("flu_err_pct", "Fluence error %"),
+                                 ("mlc_rms_max_mm", "MLC RMS max (mm)"),
+                                 ("max_gantry_error_deg", "Gantry error (deg)"),
+                                 ("mcs", "MCS (complexity)")]:
+                    vals = [r[key] for r in tx if isinstance(r.get(key), (int, float))]
+                    if vals:
+                        lines.append("%-22s mean %.4g | max %.4g | n=%d" % (
+                            lbl, float(np.mean(vals)), float(np.max(vals)), len(vals)))
+                ax.text(0.05, 0.95, "\n".join(lines), va="top", family="monospace", fontsize=10)
+                pdf.savefig(fig)
+                # page 2: histograms
+                fig2 = Figure(figsize=(8.3, 11.7))
+                for i, (key, lbl) in enumerate([("flu_err_pct", "Fluence Δ %"),
+                                                ("mlc_rms_max_mm", "MLC RMS max mm"),
+                                                ("max_gantry_error_deg", "Gantry err deg"),
+                                                ("mcs", "MCS")], 1):
+                    axh = fig2.add_subplot(2, 2, i)
+                    vals = [r[key] for r in tx if isinstance(r.get(key), (int, float))]
+                    if vals:
+                        axh.hist(vals, bins=30, color="#4e79a7")
+                    axh.set_title(lbl, fontsize=9)
+                fig2.suptitle("Distributions (%d treatment logs)" % len(tx))
+                fig2.tight_layout(); pdf.savefig(fig2)
+                # page 3: SPC chart for MLC RMS max
+                ser = [r for r in tx if r.get("_dt") and isinstance(r.get("mlc_rms_max_mm"), (int, float))]
+                ser.sort(key=lambda r: r["_dt"])
+                if len(ser) >= 2:
+                    vals = [r["mlc_rms_max_mm"] for r in ser]
+                    imr = imr_chart(vals)
+                    fig3 = Figure(figsize=(8.3, 5.5)); ax3 = fig3.add_subplot(111)
+                    ax3.plot([r["_dt"] for r in ser], vals, "-o", ms=3, color="#4e79a7")
+                    ax3.axhline(imr["xbar"], color="#59a14f"); ax3.axhline(imr["ucl"], color="#e15759", ls="--")
+                    ax3.set_title("SPC I-chart: MLC RMS max (UCL=%.4g)" % imr["ucl"])
+                    fig3.autofmt_xdate(); pdf.savefig(fig3)
+            messagebox.showinfo("הושלם", "נשמר דוח:\n" + out)
+            self._open(out)
+        except Exception as e:
+            messagebox.showerror("שגיאה", str(e))
+
+    def show_history(self):
+        try:
+            hist = load_history()
+        except Exception as e:
+            messagebox.showerror("שגיאה", str(e)); return
+        if not hist:
+            messagebox.showinfo("היסטוריה", "אין עדיין היסטוריה.\n(נשמרת אוטומטית בכל ניתוח.)"); return
+        dates = sorted(r["log_date"] for r in hist if r.get("log_date"))
+        machines = sorted(set(r.get("machine") for r in hist if r.get("machine")))
+        msg = ("היסטוריה מצטברת (כל הניתוחים):\n"
+               "סה\"כ לוגים: {0}\nמאיצים: {1}\nטווח: {2} → {3}\n\n"
+               "מיקום: {4}\n\nלמזג להיסטוריה לתצוגה (ל-SPC לאורך זמן)?").format(
+                   len(hist), ", ".join(machines), dates[0] if dates else "-",
+                   dates[-1] if dates else "-", history_db_path())
+        if messagebox.askyesno("היסטוריה", msg):
+            # merge history rows not already present (by filename) into self.rows
+            have = set(r.get("filename") for r in self.rows)
+            added = [r for r in hist if r.get("filename") not in have]
+            for r in added:
+                r.setdefault("error", "")
+            self.rows = self.rows + added
+            machines2 = sorted(set(r.get("machine") for r in self.rows if r.get("machine")))
+            self.cb_machine["values"] = ["הכל"] + machines2
+            self.refresh_table()
+            messagebox.showinfo("מוזג", "נוספו {0} לוגים מההיסטוריה.\nכעת SPC משקף את כל הזמן.".format(len(added)))
 
     def show_log_graph(self):
         if not _MPL_OK:
