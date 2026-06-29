@@ -65,6 +65,67 @@ CLINICAL = {
 }
 Z_THRESHOLD = 3.0                 # statistical outlier: z > 3 vs the cohort
 FLAG_METRICS = list(CLINICAL.keys())
+
+# ---- Statistical Process Control (TG-218 / Sanghangthum 2013) ----
+SPC_D2 = 1.128                    # control-chart constant, subgroup n=2
+SPC_D4 = 3.267                    # moving-range upper-limit constant, n=2
+EWMA_LAMBDA = 0.05               # drift sensitivity
+EWMA_L = 2.492                   # EWMA control-limit width (λ=0.05)
+
+# Published machine-QA tolerances the tool can auto-check (constancy QA).
+# (label, tolerance, units, source). These are CONSTANCY limits — a trajectory
+# log's actual-vs-expected errors are normally far inside them; the value is the
+# compliance summary + SPC trend, not per-fraction pass/fail.
+TOLERANCES = {
+    "mlc_err_max_mm": ("MLC position", 1.0, "mm", "TG-142 (0.5 MPC)"),
+    "max_gantry_error_deg": ("Gantry angle", 1.0, "°", "TG-142"),
+    "max_collimator_error_deg": ("Collimator angle", 1.0, "°", "TG-142"),
+    "max_jaw_error_cm": ("Jaw position", 0.2, "cm", "TG-142 (2 mm)"),
+    "mu_diff_pct": ("MU delivered", 0.5, "%", "log"),
+}
+# Metrics offered in the SPC chart (key, label).
+SPC_METRICS = [
+    ("mlc_rms_max_mm", "MLC RMS max (mm)"),
+    ("mlc_err_max_mm", "MLC error max (mm)"),
+    ("flu_err_pct", "fluence Δ (%)"),
+    ("max_gantry_error_deg", "Gantry error (°)"),
+    ("mu_diff_pct", "MU diff (%)"),
+    ("num_beam_holds", "Beam holds"),
+]
+
+
+def imr_chart(values):
+    """Individuals + Moving-Range control limits for a time-ordered series.
+
+    X-limits = X̄ ± 2.66·mR̄ ; mR upper = 3.267·mR̄ ; TG-218 TL = X̄ − 2.66·mR̄.
+    (Sanghangthum 2013; TG-218 Miften 2018.)"""
+    v = [float(x) for x in values if isinstance(x, (int, float))]
+    if len(v) < 2:
+        return None
+    mr = [abs(v[i] - v[i - 1]) for i in range(1, len(v))]
+    mrbar = sum(mr) / len(mr)
+    sigma = mrbar / SPC_D2
+    xbar = sum(v) / len(v)
+    return {"values": v, "xbar": xbar, "mrbar": mrbar, "sigma": sigma,
+            "ucl": xbar + 3 * sigma, "lcl": xbar - 3 * sigma,
+            "mr_ucl": SPC_D4 * mrbar, "tg218_tl": xbar - 2.66 * mrbar, "n": len(v)}
+
+
+def ewma_series(values, lam=EWMA_LAMBDA, L=EWMA_L):
+    """EWMA control chart for small-drift detection. zᵢ=λxᵢ+(1−λ)zᵢ₋₁."""
+    import math
+    v = [float(x) for x in values if isinstance(x, (int, float))]
+    if len(v) < 2:
+        return None
+    xbar = sum(v) / len(v)
+    mr = [abs(v[i] - v[i - 1]) for i in range(1, len(v))]
+    sigma = (sum(mr) / len(mr)) / SPC_D2
+    z, prev = [], xbar
+    for x in v:
+        prev = lam * x + (1 - lam) * prev
+        z.append(prev)
+    half = L * sigma * math.sqrt(lam / (2 - lam))
+    return {"z": z, "center": xbar, "ucl": xbar + half, "lcl": xbar - half}
 # QA (ArcCHECK) action limit — a measured gamma below this is a real dosimetric fail.
 QA_ACTION_LIMIT = 90.0
 QA_MATCH_DAYS = 4                 # match a log to a QA measurement within ±N days
@@ -436,6 +497,7 @@ class App(object):
         et = ttk.Entry(flt2, textvariable=self.f_date_to, width=12); et.pack(side="right", padx=4)
         et.bind("<KeyRelease>", lambda ev: self.refresh_table())
         ttk.Button(flt2, text="נקה סינון", command=self._clear_filters).pack(side="left")
+        ttk.Button(flt2, text="SPC / בקרת תהליך", command=self.show_spc).pack(side="left", padx=6)
 
         tf = ttk.Frame(self.master); tf.pack(fill="both", expand=True, padx=12, pady=8)
         cols = [c[0] for c in TREE_COLS]
@@ -681,6 +743,13 @@ class App(object):
             "systematic (בלוח מטופלים) = הטיית עלים עקבית בין פרקציות -\n"
             "מצטברת לאורך הקורס, מסוכנת יותר מרעש אקראי.\n"
             "γ נמדד מתחת ל-90% = כשל דוזימטרי אמיתי במדידה.\n\n"
+            "SPC - בקרת תהליך סטטיסטית\n-------------------------\n"
+            "כפתור 'SPC' פותח גרף בקרה לאורך זמן לכל מדד/מאיץ:\n"
+            "  I-chart - נקודות מול X̄ וגבולות ±3σ (=X̄±2.66·mR̄, TG-218).\n"
+            "            נקודה אדומה = מחוץ לבקרה (סטייה חריגה מהמכונה עצמה).\n"
+            "  EWMA    - מזהה סחף איטי שה-I-chart מפספס.\n"
+            "  קו כתום = טולרנס TG-142/MPC (MLC 1מ\"מ, גנטרי 1°, סורגים 2מ\"מ).\n"
+            "השתמש בזה כדי לראות אם המכונה סוחפת לאורך שבועות/חודשים.\n\n"
             "צבעי שורות\n----------\n"
             "לבן  - לוג טיפול תקין ומלא\n"
             "צהוב - לוג הדמיה (kV/CBCT/setup) - אין MLC/מנה\n"
@@ -799,6 +868,106 @@ class App(object):
         ax.set_ylabel("MLC RMS max (mm)"); ax.set_xlabel("תאריך")
         ax.set_title("מגמת MLC RMS על {0} לוגי טיפול".format(len(rows)))
         ax.legend(); fig.autofmt_xdate(); fig.tight_layout(); canvas.draw()
+
+    def show_spc(self):
+        """SPC control charts (I-mR + EWMA) over time, per metric/machine, with
+        TG-218 limits and a TG-142 tolerance-compliance summary."""
+        if not self._need_mpl():
+            return
+        win = tk.Toplevel(self.master)
+        win.title("SPC - בקרת תהליך סטטיסטית")
+        win.geometry("1000x740")
+        ctl = ttk.Frame(win); ctl.pack(fill="x", padx=8, pady=6)
+        ttk.Label(ctl, text=":מדד").pack(side="right")
+        v_metric = tk.StringVar(value=SPC_METRICS[0][1])
+        cb_m = ttk.Combobox(ctl, textvariable=v_metric, width=22, state="readonly",
+                            values=[lbl for _, lbl in SPC_METRICS])
+        cb_m.pack(side="right", padx=4)
+        ttk.Label(ctl, text=":מאיץ").pack(side="right", padx=(8, 0))
+        machines = ["הכל"] + sorted(set(r.get("machine") for r in self.rows if r.get("machine")))
+        v_mach = tk.StringVar(value=self.f_machine.get() if self.f_machine.get() in machines else "הכל")
+        cb_x = ttk.Combobox(ctl, textvariable=v_mach, width=10, state="readonly", values=machines)
+        cb_x.pack(side="right", padx=4)
+        summary = ttk.Label(win, font=("Helvetica", 10), justify="right")
+        summary.pack(anchor="e", padx=10)
+        fig = Figure(figsize=(9.5, 5.6), dpi=100)
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(canvas, win).update()
+
+        def redraw(*_):
+            key = dict((lbl, k) for k, lbl in SPC_METRICS)[v_metric.get()]
+            mach = v_mach.get()
+            rows = [r for r in self.rows if not r.get("is_imaging") and not r.get("error")
+                    and r.get("_dt") and isinstance(r.get(key), (int, float))]
+            if mach != "הכל":
+                rows = [r for r in rows if r.get("machine") == mach]
+            rows.sort(key=lambda r: r["_dt"])
+            vals = [float(r[key]) for r in rows]
+            dts = [r["_dt"] for r in rows]
+            fig.clear()
+            if len(vals) < 2:
+                summary.config(text="אין מספיק נתונים (צריך ≥2 לוגים).")
+                canvas.draw(); return
+            imr = imr_chart(vals); ew = ewma_series(vals)
+            ax1 = fig.add_subplot(2, 1, 1)
+            ooc = [i for i, v in enumerate(vals) if v > imr["ucl"] or v < imr["lcl"]]
+            ax1.plot(dts, vals, "-o", color="#4e79a7", ms=3, lw=0.7)
+            if ooc:
+                ax1.plot([dts[i] for i in ooc], [vals[i] for i in ooc], "o",
+                         color="#e15759", ms=6, label="מחוץ לבקרה")
+            ax1.axhline(imr["xbar"], color="#59a14f", lw=1, label="X̄")
+            ax1.axhline(imr["ucl"], color="#e15759", ls="--", lw=1, label="UCL/LCL (±3σ)")
+            ax1.axhline(imr["lcl"], color="#e15759", ls="--", lw=1)
+            tol = TOLERANCES.get(key)
+            if tol:
+                ax1.axhline(tol[1], color="#f28e2b", ls=":", lw=1.2,
+                            label="טולרנס %s %g%s" % (tol[3], tol[1], tol[2]))
+            ax1.set_title("I-chart: " + v_metric.get()); ax1.legend(fontsize=7, loc="upper left")
+            ax2 = fig.add_subplot(2, 1, 2, sharex=ax1)
+            ax2.plot(dts, ew["z"], "-", color="#b07aa1", lw=1, label="EWMA (λ=0.05)")
+            ax2.axhline(ew["center"], color="#59a14f", lw=1)
+            ax2.axhline(ew["ucl"], color="#e15759", ls="--", lw=1)
+            ax2.axhline(ew["lcl"], color="#e15759", ls="--", lw=1)
+            ax2.set_title("EWMA (זיהוי סחף איטי)"); ax2.legend(fontsize=7, loc="upper left")
+            fig.autofmt_xdate(); fig.tight_layout(); canvas.draw()
+            txt = ("n={n} | X̄={xbar:.4g} | σ̂={sig:.4g} | UCL={ucl:.4g} LCL={lcl:.4g} | "
+                   "TG-218 TL={tl:.4g} | מחוץ לבקרה: {ooc}").format(
+                n=imr["n"], xbar=imr["xbar"], sig=imr["sigma"], ucl=imr["ucl"],
+                lcl=imr["lcl"], tl=imr["tg218_tl"], ooc=len(ooc))
+            if tol:
+                within = sum(1 for v in vals if abs(v) <= tol[1])
+                txt += " | בתוך טולרנס {0}: {1}/{2}".format(tol[3], within, len(vals))
+            summary.config(text=txt)
+
+        cb_m.bind("<<ComboboxSelected>>", redraw)
+        cb_x.bind("<<ComboboxSelected>>", redraw)
+        ttk.Button(win, text="ייצא נקודות מחוץ-לבקרה ל-CSV",
+                   command=lambda: self._export_spc(v_metric.get(), v_mach.get())).pack(pady=2)
+        redraw()
+
+    def _export_spc(self, metric_label, mach):
+        key = dict((lbl, k) for k, lbl in SPC_METRICS)[metric_label]
+        rows = [r for r in self.rows if not r.get("is_imaging") and not r.get("error")
+                and r.get("_dt") and isinstance(r.get(key), (int, float))]
+        if mach != "הכל":
+            rows = [r for r in rows if r.get("machine") == mach]
+        rows.sort(key=lambda r: r["_dt"])
+        vals = [float(r[key]) for r in rows]
+        imr = imr_chart(vals)
+        if not imr:
+            messagebox.showinfo("מידע", "אין מספיק נתונים."); return
+        folder = os.path.dirname(self.out_csv) if self.out_csv else self.folder.get()
+        out = os.path.join(folder, "spc_out_of_control.csv")
+        with open(out, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["date", "machine", "patient_id", "filename", metric_label,
+                        "status", "UCL=%.4g" % imr["ucl"]])
+            for r, v in zip(rows, vals):
+                st = "OUT" if (v > imr["ucl"] or v < imr["lcl"]) else "in"
+                w.writerow([r["_dt"].date().isoformat(), r.get("machine"), r.get("patient_id"),
+                            r.get("filename"), v, st, ""])
+        messagebox.showinfo("הושלם", "נשמר:\n" + out)
 
     def show_log_graph(self):
         if not _MPL_OK:
