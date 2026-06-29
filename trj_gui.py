@@ -205,6 +205,92 @@ def load_qa_folder(folder, progress_cb):
     return meas
 
 
+try:
+    import pydicom
+    _PYDICOM_OK = True
+except Exception:
+    _PYDICOM_OK = False
+
+
+def _machine_token(name):
+    """'TrueBeam1022' -> '1022'; keeps a non-numeric name as-is."""
+    if not name:
+        return ""
+    m = re.search(r"(\d{3,5})", str(name))
+    return m.group(1) if m else str(name)
+
+
+def load_rtrecord_folder(folder, progress_cb):
+    """Parse all RTRECORD (RT.*.dcm) files → list of per-beam delivery records:
+    patient_id, date, machine, operator, fraction, beam_name, beam_on_s, termination."""
+    import datetime as _dt
+    files = []
+    for dp, _, fns in os.walk(folder):
+        for fn in fns:
+            if fn.lower().endswith(".dcm") and not fn.startswith("._"):
+                files.append(os.path.join(dp, fn))
+    files.sort()
+    recs = []
+    for i, p in enumerate(files, 1):
+        progress_cb(i, len(files), os.path.basename(p))
+        try:
+            ds = pydicom.dcmread(p, force=True)
+            if ds.get("Modality") != "RTRECORD":
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        pid = str(ds.get("PatientID", ""))
+        td = str(ds.get("TreatmentDate", ""))
+        try:
+            date = _dt.datetime.strptime(td, "%Y%m%d").date() if td else None
+        except ValueError:
+            date = None
+        op = str(ds.get("OperatorsName", "") or "")
+        machine = ""
+        for tm in ds.get("TreatmentMachineSequence", [])[:1]:
+            machine = _machine_token(tm.get("TreatmentMachineName"))
+        for b in ds.get("TreatmentSessionBeamSequence", []):
+            recs.append({
+                "patient_id": pid, "date": date, "machine": machine, "operator": op,
+                "fraction": b.get("CurrentFractionNumber"),
+                "beam_name": str(b.get("BeamName", "") or ""),
+                "beam_on_s": b.get("DeliveredTreatmentTime"),
+                "termination": str(b.get("TreatmentTerminationStatus", "") or ""),
+            })
+    return recs
+
+
+def match_rtrecord(rows, records):
+    """Attach fraction / termination / operator / rt_beam_on_s to each log row by
+    patient_id + same date (treatment session), preferring a same beam-name match."""
+    from collections import defaultdict
+    by_key = defaultdict(list)
+    for r in records:
+        if r["date"]:
+            by_key[(str(r["patient_id"]), r["date"])].append(r)
+    n = 0
+    for row in rows:
+        row["fraction"] = ""
+        row["termination"] = ""
+        row["operator"] = ""
+        row["rt_beam_on_s"] = ""
+        dt = row.get("_dt")
+        if dt is None:
+            continue
+        key = (str(row.get("patient_id", "")), dt.date())
+        cands = by_key.get(key)
+        if not cands:
+            continue
+        bn = str(row.get("beam_name", "")).strip()
+        match = next((c for c in cands if c["beam_name"].strip() == bn and bn), cands[0])
+        row["fraction"] = match["fraction"] if match["fraction"] is not None else ""
+        row["termination"] = match["termination"]
+        row["operator"] = match["operator"]
+        row["rt_beam_on_s"] = round(float(match["beam_on_s"]), 2) if match["beam_on_s"] is not None else ""
+        n += 1
+    return n
+
+
 def match_qa(rows, measurements):
     """Attach measured_gamma_pct to each log row by patient_id + nearest date (±days)."""
     from collections import defaultdict
@@ -237,8 +323,9 @@ COLUMNS = ["filename", "machine", "patient_id", "plan_name", "beam_name", "energ
            "mlc_rms_avg_mm", "mlc_rms_max_mm",
            "mlc_err_p95_mm", "mlc_err_max_mm", "mlc_bias_mm", "max_gantry_error_deg",
            "max_collimator_error_deg", "max_jaw_error_cm", "num_beam_holds",
-           "beam_hold_fraction", "beam_on_s", "measured_gamma_pct", "is_truncated", "is_imaging",
-           "plan_uid", "error"]
+           "beam_hold_fraction", "beam_on_s", "measured_gamma_pct",
+           "fraction", "termination", "operator", "rt_beam_on_s",
+           "is_truncated", "is_imaging", "plan_uid", "error"]
 
 # columns shown in the on-screen table (key subset)
 TREE_COLS = [
@@ -253,7 +340,9 @@ TREE_COLS = [
     ("mlc_rms_max_mm", "MLC max", 70),
     ("max_gantry_error_deg", "גנטרי err", 70),
     ("num_beam_holds", "holds", 50),
-    ("measured_gamma_pct", "γ נמדד", 60),
+    ("measured_gamma_pct", "γ נמדד", 55),
+    ("fraction", "פרקציה", 55),
+    ("termination", "סיום", 80),
     ("is_truncated", "חתוך", 50),
 ]
 
@@ -475,6 +564,7 @@ class App(object):
         ttk.Button(flt, text="מפת fluence", command=self.show_fluence).pack(side="left", padx=2)
         ttk.Button(flt, text="outliers / מטופלים", command=self.show_outliers).pack(side="left", padx=2)
         ttk.Button(flt, text="טען QA (ArcCHECK)", command=self.load_qa).pack(side="left", padx=2)
+        ttk.Button(flt, text="טען RTRECORD", command=self.load_rtrecord).pack(side="left", padx=2)
         ttk.Label(flt, text=":חיפוש").pack(side="right")
         e = ttk.Entry(flt, textvariable=self.search, width=16); e.pack(side="right", padx=6)
         e.bind("<KeyRelease>", lambda ev: self.refresh_table())
@@ -736,7 +826,13 @@ class App(object):
             "גנטרי err   - שגיאת זווית הגנטרי המקסימלית (מעלות)\n"
             "holds       - מספר עצירות קרן (gating / מעברי שדה / השהיות)\n"
             "γ נמדד      - gamma שנמדד ב-ArcCHECK (אחרי 'טען QA') = אמת המנה האמיתית\n"
+            "פרקציה      - מספר הפרקציה (אחרי 'טען RTRECORD', מ-ARIA)\n"
+            "סיום        - סטטוס סיום הטיפול. NORMAL=תקין; אחר=הפרעה\n"
             "חתוך        - האם הלוג נקטע (טיפול > 20 דק'). True = נתונים חלקיים\n\n"
+            "טען RTRECORD\n------------\n"
+            "מצביע על תיקיית רשומות-טיפול (RT.*.dcm מ-ARIA) ומצליב ללוגים לפי\n"
+            "מטופל+תאריך. מוסיף: פרקציה, סטטוס-סיום (הפרעות), מפעיל, זמן beam-on\n"
+            "סמכותי מ-ARIA. הערה: ה-MU שנמסר נלקח מהלוג (לא מאוכלס ב-RTRECORD).\n\n"
             "מה באמת מסוכן?\n--------------\n"
             "fluence Δ% (דוזימטרי) מוביל את הדירוג - הוא אומר אם הסטייה המכנית\n"
             "באמת שינתה את הפלואנס/מנה. 'מפת fluence' מראה איפה על השדה.\n"
@@ -1075,6 +1171,62 @@ class App(object):
         messagebox.showinfo("QA נטען",
                             "נטענו {0} מדידות QA; הותאמו ל-{1} לוגים.\n"
                             "פתח 'outliers / מטופלים' לתצוגת חזוי-מול-נמדד.".format(nmeas, nmatch))
+
+    def load_rtrecord(self):
+        if not self.rows:
+            messagebox.showinfo("מידע", "קודם הרץ ניתוח לוגים."); return
+        if not _PYDICOM_OK:
+            messagebox.showwarning("לא זמין", "pydicom לא מותקן בגרסה זו."); return
+        folder = filedialog.askdirectory(title="בחר תיקיית רשומות טיפול (RTRECORD / RT.*.dcm)")
+        if not folder:
+            return
+        win = tk.Toplevel(self.master); win.title("טוען RTRECORD..."); win.geometry("440x90")
+        lbl = ttk.Label(win, text="טוען רשומות טיפול..."); lbl.pack(pady=8)
+        pb = ttk.Progressbar(win, mode="determinate"); pb.pack(fill="x", padx=10)
+
+        def prog(d, t, m):
+            self.master.after(0, lambda: (pb.configure(maximum=t, value=d),
+                                          lbl.configure(text="RTRECORD {0}/{1}".format(d, t))))
+
+        def work():
+            try:
+                recs = load_rtrecord_folder(folder, prog)
+                n = match_rtrecord(self.rows, recs)
+                self.master.after(0, lambda: self._rtrecord_done(win, len(recs), n))
+            except Exception as e:
+                self.master.after(0, lambda: (win.destroy(), messagebox.showerror("שגיאה", str(e))))
+        th = threading.Thread(target=work); th.daemon = True; th.start()
+
+    def _rtrecord_done(self, win, nrec, nmatch):
+        win.destroy()
+        self.refresh_table()
+        # count interruptions among matched logs
+        interrupted = [r for r in self.rows if r.get("termination")
+                       and str(r.get("termination")).upper() != "NORMAL"]
+        msg = ("נטענו {0} רשומות-טיפול; הותאמו ל-{1} לוגים.\n"
+               "הפרעות (termination≠NORMAL): {2}.").format(nrec, nmatch, len(interrupted))
+        if interrupted:
+            msg += "\n\nלחץ 'הפרעות טיפול' לצפייה."
+        messagebox.showinfo("RTRECORD נטען", msg)
+        if interrupted:
+            self._show_interruptions(interrupted)
+
+    def _show_interruptions(self, interrupted):
+        win = tk.Toplevel(self.master); win.title("הפרעות טיפול (RTRECORD)"); win.geometry("820x460")
+        ttk.Label(win, font=("Helvetica", 11, "bold"),
+                  text="{0} פרקציות עם סטטוס סיום ≠ NORMAL".format(len(interrupted))).pack(pady=6)
+        cols = ["date", "machine", "patient_id", "beam_name", "fraction", "termination",
+                "operator", "rt_beam_on_s"]
+        tv = ttk.Treeview(win, columns=cols, show="headings")
+        for c, w in zip(cols, [90, 60, 80, 90, 60, 110, 100, 90]):
+            tv.heading(c, text=c); tv.column(c, width=w, anchor="center")
+        vs = ttk.Scrollbar(win, orient="vertical", command=tv.yview); tv.configure(yscrollcommand=vs.set)
+        tv.pack(side="left", fill="both", expand=True); vs.pack(side="right", fill="y")
+        for r in sorted(interrupted, key=lambda x: (x.get("_dt") or datetime.min)):
+            d = r["_dt"].date().isoformat() if r.get("_dt") else ""
+            tv.insert("", "end", values=[d, r.get("machine"), r.get("patient_id"),
+                                         r.get("beam_name"), r.get("fraction"), r.get("termination"),
+                                         r.get("operator"), r.get("rt_beam_on_s")])
 
     def show_outliers(self):
         if not self.rows:
