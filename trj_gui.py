@@ -169,7 +169,7 @@ APP_TITLE = "Davidoff Physics Trajectory Log"
 APP_SUBTITLE = "ניתוח קבצי Trajectory Log (.bin) - TrueBeam"
 
 # full output columns (CSV/Excel)
-COLUMNS = ["filename", "patient_id", "plan_name", "beam_name", "energy", "mlc_model",
+COLUMNS = ["filename", "machine", "patient_id", "plan_name", "beam_name", "energy", "mlc_model",
            "num_snapshots", "sampling_interval_ms", "duration_s", "num_subbeams",
            "mu_planned", "mu_delivered", "mu_diff_pct",
            "flu_err_pct", "flu_max_local_pct",
@@ -181,7 +181,8 @@ COLUMNS = ["filename", "patient_id", "plan_name", "beam_name", "energy", "mlc_mo
 
 # columns shown in the on-screen table (key subset)
 TREE_COLS = [
-    ("filename", "קובץ", 230),
+    ("filename", "קובץ", 200),
+    ("machine", "מאיץ", 60),
     ("patient_id", "מטופל", 80),
     ("beam_name", "שדה", 90),
     ("energy", "אנרגיה", 70),
@@ -206,6 +207,34 @@ def scan_bin(root):
     return out
 
 
+# Machine name is NOT stored in the .bin — derive it from the folder path.
+# Recognized linac tokens (Varian naming): H193868, LA1, TrueBeam3868, SN1022.
+_MACHINE_PATTERNS = [
+    re.compile(r"H(\d{5,6})", re.I),          # H193868 -> 3868 (Varian host id)
+    re.compile(r"\b(LA\d+)\b", re.I),         # LA1, LA3
+    re.compile(r"TrueBeam\s*(\d+)", re.I),    # TrueBeam3868
+    re.compile(r"\bSN\s*(\d+)\b", re.I),      # SN1022
+]
+
+
+def machine_from_path(path, root):
+    """Best-effort machine label from the path. Tries known linac tokens; falls
+    back to the first folder component under the chosen root."""
+    rel = os.path.relpath(path, root)
+    parts = rel.replace("\\", "/").split("/")
+    hay = rel.replace("\\", "/")
+    for pat in _MACHINE_PATTERNS:
+        m = pat.search(hay)
+        if m:
+            tok = m.group(1)
+            # H193868 -> last 4 digits are the common machine id (3868)
+            if pat.pattern.startswith("H") and len(tok) >= 4:
+                return tok[-4:]
+            return tok.upper()
+    # fallback: top folder under root (the machine's directory), else "?"
+    return parts[0] if len(parts) > 1 else "?"
+
+
 def analyze_folder(root, progress_cb):
     files = scan_bin(root)
     rows, fails = [], 0
@@ -222,6 +251,7 @@ def analyze_folder(root, progress_cb):
         # session-timing + per-log re-load helpers
         row["_dt"] = TB_parse_dt(os.path.basename(path))
         row["_path"] = path
+        row["machine"] = machine_from_path(path, root)
         rows.append(row)
     return rows, total, fails
 
@@ -338,6 +368,9 @@ class App(object):
         master.geometry("1120x720")
         self.folder = tk.StringVar()
         self.f_type = tk.StringVar(value="הכל")
+        self.f_machine = tk.StringVar(value="הכל")
+        self.f_date_from = tk.StringVar()
+        self.f_date_to = tk.StringVar()
         self.search = tk.StringVar()
         self.rows = []
         self.out_csv = None
@@ -388,6 +421,21 @@ class App(object):
         cb = ttk.Combobox(flt, textvariable=self.f_type, width=10, state="readonly",
                           values=["הכל", "טיפול", "הדמיה", "חתוך"])
         cb.pack(side="right", padx=4); cb.bind("<<ComboboxSelected>>", lambda ev: self.refresh_table())
+
+        # second filter row: machine + date range
+        flt2 = ttk.Frame(self.master); flt2.pack(fill="x", padx=12, pady=(0, 2))
+        ttk.Label(flt2, text=":מאיץ").pack(side="right")
+        self.cb_machine = ttk.Combobox(flt2, textvariable=self.f_machine, width=10,
+                                       state="readonly", values=["הכל"])
+        self.cb_machine.pack(side="right", padx=4)
+        self.cb_machine.bind("<<ComboboxSelected>>", lambda ev: self.refresh_table())
+        ttk.Label(flt2, text=":תאריך מ (YYYY-MM-DD)").pack(side="right", padx=(10, 0))
+        ef = ttk.Entry(flt2, textvariable=self.f_date_from, width=12); ef.pack(side="right", padx=4)
+        ef.bind("<KeyRelease>", lambda ev: self.refresh_table())
+        ttk.Label(flt2, text=":עד").pack(side="right")
+        et = ttk.Entry(flt2, textvariable=self.f_date_to, width=12); et.pack(side="right", padx=4)
+        et.bind("<KeyRelease>", lambda ev: self.refresh_table())
+        ttk.Button(flt2, text="נקה סינון", command=self._clear_filters).pack(side="left")
 
         tf = ttk.Frame(self.master); tf.pack(fill="both", expand=True, padx=12, pady=8)
         cols = [c[0] for c in TREE_COLS]
@@ -451,11 +499,14 @@ class App(object):
         self.rows = rows; self.out_csv = out
         n_img = sum(1 for r in rows if r.get("is_imaging"))
         n_tr = sum(1 for r in rows if r.get("is_truncated"))
-        self.summary.config(text="לוגים: {0}  |  טיפול: {1}  |  הדמיה: {2}  |  חתוכים: {3}  |  כשלים: {4}".format(
-            total, total - n_img - fails, n_img, n_tr, fails))
+        machines = sorted(set(r.get("machine") for r in rows if r.get("machine")))
+        self.cb_machine["values"] = ["הכל"] + machines
+        self.summary.config(text="לוגים: {0}  |  מאיצים: {1}  |  טיפול: {2}  |  הדמיה: {3}  |  חתוכים: {4}  |  כשלים: {5}".format(
+            total, len(machines), total - n_img - fails, n_img, n_tr, fails))
         self.status.config(text="הסתיים." + ("  נשמר: " + out if out else ""))
         self.refresh_table()
-        messagebox.showinfo("הסתיים", "נותחו {0} לוגים ({1} כשלים).".format(total, fails))
+        messagebox.showinfo("הסתיים", "נותחו {0} לוגים מ-{1} מאיצים ({2} כשלים).".format(
+            total, len(machines), fails))
 
     def _on_err(self, msg):
         self.running = False; self.run_btn.config(state="normal")
@@ -464,6 +515,9 @@ class App(object):
     def _filtered(self):
         q = self.search.get().strip().lower()
         ft = self.f_type.get()
+        machine = self.f_machine.get()
+        d_from = self.f_date_from.get().strip()
+        d_to = self.f_date_to.get().strip()
         out = []
         for r in self.rows:
             if ft == "טיפול" and (r.get("is_imaging") or r.get("error")):
@@ -472,6 +526,17 @@ class App(object):
                 continue
             if ft == "חתוך" and not r.get("is_truncated"):
                 continue
+            if machine not in ("הכל", "") and r.get("machine") != machine:
+                continue
+            if d_from or d_to:
+                dt = r.get("_dt")
+                ds = dt.date().isoformat() if dt else ""
+                if not ds:
+                    continue                       # undated logs drop out when filtering by date
+                if d_from and ds < d_from:
+                    continue
+                if d_to and ds > d_to:
+                    continue
             if q:
                 hay = (str(r.get("filename", "")) + " " + str(r.get("patient_id", "")) +
                        " " + str(r.get("plan_name", ""))).lower()
@@ -479,6 +544,14 @@ class App(object):
                     continue
             out.append(r)
         return out
+
+    def _clear_filters(self):
+        self.f_type.set("הכל")
+        self.f_machine.set("הכל")
+        self.f_date_from.set("")
+        self.f_date_to.set("")
+        self.search.set("")
+        self.refresh_table()
 
     def refresh_table(self):
         for i in self.tree.get_children():
@@ -584,8 +657,13 @@ class App(object):
         c = CLINICAL
         content = (
             "מקרא והסבר\n==========\n\n"
+            "תיקייה ומאיצים\n--------------\n"
+            "אפשר להצביע על תיקיית-אב שמכילה את כל המאיצים (סריקה רקורסיבית).\n"
+            "שם המאיץ נגזר מנתיב התיקייה (H193868->3868, LA1, TrueBeam3597, SN1022).\n"
+            "סינון: מאיץ (תפריט) | טווח תאריכים (מ/עד, YYYY-MM-DD) | חיפוש מטופל | סוג.\n\n"
             "עמודות הטבלה\n------------\n"
             "קובץ        - שם קובץ הלוג (.bin)\n"
+            "מאיץ        - המאיץ (נגזר מהנתיב)\n"
             "מטופל       - מספר זהות המטופל\n"
             "שדה         - שם השדה / הקשת\n"
             "אנרגיה      - אנרגיית הקרן (6x, 10x, 10xFFF...)\n"
