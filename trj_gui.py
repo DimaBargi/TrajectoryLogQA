@@ -215,6 +215,109 @@ except Exception:
     _PYDICOM_OK = False
 
 
+# ------------------------- MPC (Machine Performance Check) -------------------------
+# Ported from the validated mpc_parse.py (1217 reports). Needs gap-based space
+# reconstruction (columns are layout gaps, not literal spaces).
+_MPC_SECTION = re.compile(r"(?m)^\s*([0-9]+x(?:FFF)?)\s*-\s*(Beam(?: & Geometry)? Check[^\n]*)")
+_MPC_METRIC = re.compile(
+    r"([A-Za-z][\w /()\-]*?)\s+"
+    r"(Within Thresholds|Close(?:[\w ]*)Thresholds|Outside(?:[\w ]*)Thresholds)\s+"
+    r"(-?\d+(?:\.\d+)?)\s*(%|mm|°)(?:\s*±\s*(\d+(?:\.\d+)?)\s*(%|mm|°))?")
+_MPC_DATE = re.compile(r"(20\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})")
+
+
+def _mpc_layout(pdf_path):
+    """Rebuild visual rows with gap-based spacing (MPC column alignment)."""
+    rsrcmgr = PDFResourceManager()
+    device = PDFPageAggregator(rsrcmgr, laparams=LAParams())
+    interp = PDFPageInterpreter(rsrcmgr, device)
+    out = []
+    with open(pdf_path, "rb") as fp:
+        for page in PDFPage.get_pages(fp):
+            interp.process_page(page)
+            chars = []
+
+            def walk(o):
+                for c in o:
+                    if isinstance(c, LTChar):
+                        chars.append(c)
+                    elif isinstance(c, LTTextContainer):
+                        walk(c)
+            walk(device.get_result())
+            if not chars:
+                continue
+            rows = {}
+            for c in chars:
+                rows.setdefault(int(round(c.y0 / 3.0)), []).append(c)
+            for k in sorted(rows, reverse=True):
+                line = sorted(rows[k], key=lambda ch: ch.x0)
+                cw = sum(ch.width for ch in line) / max(len(line), 1)
+                s, prev = "", None
+                for ch in line:
+                    if prev is not None and cw:
+                        n = int(round((ch.x0 - prev) / (cw * 0.6)))
+                        if n > 0:
+                            s += " " * min(n, 200)
+                    s += ch.get_text()
+                    prev = ch.x1
+                out.append(s.rstrip())
+    return "\n".join(out)
+
+
+def parse_mpc_session(path):
+    """One MPC Session report PDF -> list of metric rows."""
+    try:
+        text = _mpc_layout(path)
+    except Exception:  # noqa: BLE001
+        return []
+    if not text:
+        return []
+    m = _MPC_DATE.search(os.path.basename(path))
+    try:
+        sdt = datetime.strptime(m.group(1), "%Y-%m-%d-%H-%M-%S") if m else None
+    except ValueError:
+        sdt = None
+    mm = re.search(r"Machine:\s*#?(\S+)", text)
+    machine = _machine_token(mm.group(1)) if mm else ""
+    sections = [(s.start(), s.group(1), s.group(2).strip()) for s in _MPC_SECTION.finditer(text)]
+
+    def sect(pos):
+        e, c = "", ""
+        for sp, ee, cc in sections:
+            if sp <= pos:
+                e, c = ee, cc
+            else:
+                break
+        return e, c
+
+    rows = []
+    for mt in _MPC_METRIC.finditer(text):
+        try:
+            val = float(mt.group(3))
+        except (TypeError, ValueError):
+            continue
+        ev = re.sub(r"\s+", " ", mt.group(2)).strip()
+        energy, check = sect(mt.start())
+        status = ("within" if "Within" in ev else "outside" if "Outside" in ev else "close")
+        rows.append({"datetime": sdt, "date": sdt.date().isoformat() if sdt else "",
+                     "machine": machine, "energy": energy, "check": check,
+                     "metric": re.sub(r"\s+", " ", mt.group(1)).strip(),
+                     "value": val, "unit": mt.group(4),
+                     "threshold": float(mt.group(5)) if mt.group(5) else "",
+                     "status": status})
+    return rows
+
+
+def find_mpc_reports(root):
+    out = []
+    for dp, _, fns in os.walk(root):
+        for fn in fns:
+            if fn.lower().startswith("session-") and fn.lower().endswith(".pdf"):
+                out.append(os.path.join(dp, fn))
+    out.sort()
+    return out
+
+
 def _machine_token(name):
     """'TrueBeam1022' -> '1022'; keeps a non-numeric name as-is."""
     if not name:
@@ -599,6 +702,7 @@ class App(object):
         self.f_date_to = tk.StringVar()
         self.search = tk.StringVar()
         self.rows = []
+        self.mpc_rows = []
         self.out_csv = None
         self.running = False
         self._sort_col = None
@@ -666,6 +770,15 @@ class App(object):
         ttk.Button(flt2, text="SPC / בקרת תהליך", command=self.show_spc).pack(side="left", padx=6)
         ttk.Button(flt2, text="דוח PDF", command=self.export_pdf_report).pack(side="left", padx=2)
         ttk.Button(flt2, text="היסטוריה", command=self.show_history).pack(side="left", padx=2)
+        ttk.Button(flt2, text="טען MPC", command=self.load_mpc).pack(side="left", padx=2)
+        ttk.Button(flt2, text="מגמות MPC", command=self.show_mpc_trend).pack(side="left", padx=2)
+
+        # per-machine tabs (selecting a tab filters to that machine; all tools follow)
+        self.nb_machines = ttk.Notebook(self.master)
+        self.nb_machines.pack(fill="x", padx=12)
+        self._tab_machines = ["הכל"]
+        self._rebuild_machine_tabs()
+        self.nb_machines.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         tf = ttk.Frame(self.master); tf.pack(fill="both", expand=True, padx=12, pady=8)
         cols = [c[0] for c in TREE_COLS]
@@ -735,6 +848,7 @@ class App(object):
             pass
         machines = sorted(set(r.get("machine") for r in rows if r.get("machine")))
         self.cb_machine["values"] = ["הכל"] + machines
+        self._rebuild_machine_tabs()
         self.summary.config(text="לוגים: {0}  |  מאיצים: {1}  |  טיפול: {2}  |  הדמיה: {3}  |  חתוכים: {4}  |  כשלים: {5}".format(
             total, len(machines), total - n_img - fails, n_img, n_tr, fails))
         self.status.config(text="הסתיים." + ("  נשמר: " + out if out else ""))
@@ -786,6 +900,120 @@ class App(object):
         self.f_date_to.set("")
         self.search.set("")
         self.refresh_table()
+
+    def _rebuild_machine_tabs(self):
+        """Tabs = הכל + one per machine (from logs and/or MPC). Selecting filters."""
+        for t in self.nb_machines.tabs():
+            self.nb_machines.forget(t)
+        machines = sorted(set(r.get("machine") for r in self.rows if r.get("machine")) |
+                          set(r.get("machine") for r in self.mpc_rows if r.get("machine")))
+        self._tab_machines = ["הכל"] + machines
+        for name in self._tab_machines:
+            f = ttk.Frame(self.nb_machines)
+            self.nb_machines.add(f, text=("כל המאיצים" if name == "הכל" else "מאיץ " + name))
+
+    def _on_tab_changed(self, _evt=None):
+        idx = self.nb_machines.index(self.nb_machines.select())
+        if 0 <= idx < len(self._tab_machines):
+            self.f_machine.set(self._tab_machines[idx])
+            self.refresh_table()
+
+    # ---------- MPC ----------
+    def load_mpc(self):
+        if not _PDFMINER_OK:
+            messagebox.showwarning("לא זמין", "pdfminer לא מותקן."); return
+        folder = self.folder.get().strip()
+        if not folder or not os.path.isdir(folder):
+            folder = filedialog.askdirectory(title="בחר תיקייה עם דוחות MPC (Session-*.pdf)")
+            if not folder:
+                return
+        reports = find_mpc_reports(folder)
+        if not reports:
+            messagebox.showinfo("MPC", "לא נמצאו דוחות MPC (Session-*.pdf) בתיקייה."); return
+        win = tk.Toplevel(self.master); win.title("טוען MPC..."); win.geometry("440x90")
+        lbl = ttk.Label(win, text="טוען דוחות MPC..."); lbl.pack(pady=8)
+        pb = ttk.Progressbar(win, mode="determinate", maximum=len(reports)); pb.pack(fill="x", padx=10)
+
+        def work():
+            rows = []
+            for i, p in enumerate(reports, 1):
+                try:
+                    rows.extend(parse_mpc_session(p))
+                except Exception:  # noqa: BLE001
+                    pass
+                if i % 25 == 0 or i == len(reports):
+                    self.master.after(0, lambda i=i: (pb.configure(value=i),
+                                                      lbl.configure(text="MPC %d/%d" % (i, len(reports)))))
+            self.master.after(0, lambda: self._mpc_done(win, rows, len(reports)))
+        th = threading.Thread(target=work); th.daemon = True; th.start()
+
+    def _mpc_done(self, win, rows, nrep):
+        win.destroy()
+        self.mpc_rows = rows
+        n_out = sum(1 for r in rows if r.get("status") == "outside")
+        machines = sorted(set(r.get("machine") for r in rows if r.get("machine")))
+        self._rebuild_machine_tabs()
+        messagebox.showinfo("MPC נטען",
+                            "נותחו {0} דוחות MPC -> {1} מדידות.\nמאיצים: {2}\nמחוץ-לטולרנס: {3}\n\n"
+                            "פתח 'מגמות MPC' לגרפי בקרה לאורך זמן.".format(
+                                nrep, len(rows), ", ".join(machines), n_out))
+
+    def show_mpc_trend(self):
+        if not self.mpc_rows:
+            messagebox.showinfo("MPC", "קודם לחץ 'טען MPC'."); return
+        if not _MPL_OK:
+            messagebox.showwarning("לא זמין", "matplotlib לא מותקן."); return
+        win = tk.Toplevel(self.master); win.title("מגמות MPC - בקרת ביצועי מאיץ"); win.geometry("1000x720")
+        ctl = ttk.Frame(win); ctl.pack(fill="x", padx=8, pady=6)
+        metrics = sorted(set(r["metric"] for r in self.mpc_rows))
+        machines = ["הכל"] + sorted(set(r["machine"] for r in self.mpc_rows if r.get("machine")))
+        energies = ["הכל"] + sorted(set(r["energy"] for r in self.mpc_rows if r.get("energy")))
+        v_metric = tk.StringVar(value="Output Change" if "Output Change" in metrics else metrics[0])
+        v_mach = tk.StringVar(value=self.f_machine.get() if self.f_machine.get() in machines else "הכל")
+        v_energy = tk.StringVar(value="הכל")
+        ttk.Label(ctl, text=":מדד").pack(side="right")
+        ttk.Combobox(ctl, textvariable=v_metric, width=26, state="readonly", values=metrics).pack(side="right", padx=4)
+        ttk.Label(ctl, text=":מאיץ").pack(side="right", padx=(8, 0))
+        ttk.Combobox(ctl, textvariable=v_mach, width=8, state="readonly", values=machines).pack(side="right", padx=4)
+        ttk.Label(ctl, text=":אנרגיה").pack(side="right", padx=(8, 0))
+        ttk.Combobox(ctl, textvariable=v_energy, width=8, state="readonly", values=energies).pack(side="right", padx=4)
+        summary = ttk.Label(win, font=("Helvetica", 10), justify="right"); summary.pack(anchor="e", padx=10)
+        fig = Figure(figsize=(9.5, 5.6), dpi=100)
+        canvas = FigureCanvasTkAgg(fig, master=win); canvas.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(canvas, win).update()
+
+        def redraw(*_):
+            rows = [r for r in self.mpc_rows if r["metric"] == v_metric.get() and r.get("datetime")]
+            if v_mach.get() != "הכל":
+                rows = [r for r in rows if r["machine"] == v_mach.get()]
+            if v_energy.get() != "הכל":
+                rows = [r for r in rows if r["energy"] == v_energy.get()]
+            rows.sort(key=lambda r: r["datetime"])
+            fig.clear(); ax = fig.add_subplot(111)
+            if len(rows) < 2:
+                summary.config(text="אין מספיק נתונים."); canvas.draw(); return
+            dts = [r["datetime"] for r in rows]; vals = [r["value"] for r in rows]
+            thr = next((r["threshold"] for r in rows if isinstance(r.get("threshold"), (int, float))), None)
+            imr = imr_chart(vals)
+            colors = ["#e15759" if r["status"] == "outside" else
+                      "#f28e2b" if r["status"] == "close" else "#4e79a7" for r in rows]
+            ax.scatter(dts, vals, c=colors, s=10)
+            ax.plot(dts, vals, color="#bbb", lw=0.4)
+            ax.axhline(imr["xbar"], color="#59a14f", lw=1, label="X̄")
+            ax.axhline(imr["ucl"], color="#999", ls="--", lw=1, label="±3σ (SPC)")
+            ax.axhline(imr["lcl"], color="#999", ls="--", lw=1)
+            if thr is not None:
+                ax.axhline(thr, color="#e15759", ls=":", lw=1.3, label="טולרנס ±%g" % thr)
+                ax.axhline(-thr, color="#e15759", ls=":", lw=1.3)
+            ax.set_title("MPC: %s" % v_metric.get()); ax.legend(fontsize=7, loc="upper left")
+            fig.autofmt_xdate(); fig.tight_layout(); canvas.draw()
+            n_out = sum(1 for r in rows if r["status"] == "outside")
+            summary.config(text="n={0} | X̄={1:.4g} | σ̂={2:.4g} | טווח {3}→{4} | מחוץ-לטולרנס: {5}".format(
+                imr["n"], imr["xbar"], imr["sigma"], rows[0]["date"], rows[-1]["date"], n_out))
+        for cb in ctl.winfo_children():
+            if isinstance(cb, ttk.Combobox):
+                cb.bind("<<ComboboxSelected>>", redraw)
+        redraw()
 
     def refresh_table(self):
         for i in self.tree.get_children():
@@ -891,10 +1119,17 @@ class App(object):
         c = CLINICAL
         content = (
             "מקרא והסבר\n==========\n\n"
-            "תיקייה ומאיצים\n--------------\n"
-            "אפשר להצביע על תיקיית-אב שמכילה את כל המאיצים (סריקה רקורסיבית).\n"
-            "שם המאיץ נגזר מנתיב התיקייה (H193868->3868, LA1, TrueBeam3597, SN1022).\n"
-            "סינון: מאיץ (תפריט) | טווח תאריכים (מ/עד, YYYY-MM-DD) | חיפוש מטופל | סוג.\n\n"
+            "תיקייה, מאיצים וטאבים\n---------------------\n"
+            "הצבע על תיקיית-אב שמכילה את כל המאיצים (סריקה רקורסיבית).\n"
+            "שם המאיץ נגזר מהנתיב (H193868->3868, LA1, TrueBeam3597, SN1022).\n"
+            "טאב לכל מאיץ (למעלה): לחיצה מסננת לאותו מאיץ, וכל הכלים\n"
+            "(SPC/גרפים/outliers/MPC) עובדים על המאיץ שנבחר. 'כל המאיצים'=הכל.\n"
+            "סינון נוסף: טווח תאריכים | חיפוש מטופל | סוג.\n\n"
+            "MPC (ביצועי מאיץ)\n-----------------\n"
+            "'טען MPC' סורק את אותה תיקיית-אב לדוחות Session-*.pdf (תחת כל מאיץ),\n"
+            "מנתח אותם ומזהה מכונה מכל דוח. 'מגמות MPC' מציג גרף בקרה לאורך זמן\n"
+            "(Output Change / MLC / isocenter...) לכל מדד/מאיץ/אנרגיה, עם קו טולרנס.\n"
+            "כך רואים סחף בביצועי המאיץ על פני חודשים/שנים.\n\n"
             "עמודות הטבלה\n------------\n"
             "קובץ        - שם קובץ הלוג (.bin)\n"
             "מאיץ        - המאיץ (נגזר מהנתיב)\n"
