@@ -772,6 +772,7 @@ class App(object):
         ttk.Button(flt2, text="היסטוריה", command=self.show_history).pack(side="left", padx=2)
         ttk.Button(flt2, text="טען MPC", command=self.load_mpc).pack(side="left", padx=2)
         ttk.Button(flt2, text="מגמות MPC", command=self.show_mpc_trend).pack(side="left", padx=2)
+        ttk.Button(flt2, text="ייצא MPC", command=self.export_mpc_all).pack(side="left", padx=2)
 
         # per-machine tabs (selecting a tab filters to that machine; all tools follow)
         self.nb_machines = ttk.Notebook(self.master)
@@ -958,6 +959,90 @@ class App(object):
                             "פתח 'מגמות MPC' לגרפי בקרה לאורך זמן.".format(
                                 nrep, len(rows), ", ".join(machines), n_out))
 
+    def export_mpc_all(self):
+        """Export ALL parsed MPC data (every machine, every metric) to CSV + Excel."""
+        if not self.mpc_rows:
+            messagebox.showinfo("MPC", "קודם לחץ 'טען MPC'."); return
+        folder = os.path.dirname(self.out_csv) if self.out_csv else self.folder.get()
+        cols = ["datetime", "date", "machine", "energy", "check", "metric",
+                "value", "unit", "threshold", "status"]
+        out_csv = os.path.join(folder, "mpc_all_machines.csv")
+        rows = sorted(self.mpc_rows, key=lambda r: (r.get("machine", ""),
+                      r.get("metric", ""), r.get("datetime") or datetime.min))
+        with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            for r in rows:
+                dt = r.get("datetime")
+                w.writerow([dt.isoformat(sep=" ") if dt else "", r.get("date"),
+                            r.get("machine"), r.get("energy"), r.get("check"), r.get("metric"),
+                            r.get("value"), r.get("unit"), r.get("threshold"), r.get("status")])
+        msg = "נשמר CSV:\n%s\n(%d מדידות MPC)" % (out_csv, len(rows))
+        if _OPENPYXL_OK:
+            out_x = os.path.join(folder, "mpc_all_machines.xlsx")
+            try:
+                wb = openpyxl.Workbook(); ws = wb.active; ws.title = "MPC"
+                hf = PatternFill("solid", fgColor="305496"); hfont = Font(bold=True, color="FFFFFF")
+                fills = {"within": PatternFill("solid", fgColor="C6EFCE"),
+                         "close": PatternFill("solid", fgColor="FFEB9C"),
+                         "outside": PatternFill("solid", fgColor="F8CBAD")}
+                ws.append(cols)
+                for c in ws[1]:
+                    c.fill, c.font, c.alignment = hf, hfont, Alignment(horizontal="center")
+                for r in rows:
+                    dt = r.get("datetime")
+                    ws.append([dt.isoformat(sep=" ") if dt else "", r.get("date"), r.get("machine"),
+                               r.get("energy"), r.get("check"), r.get("metric"), r.get("value"),
+                               r.get("unit"), r.get("threshold"), r.get("status")])
+                    fill = fills.get(r.get("status"))
+                    if fill:
+                        for c in ws[ws.max_row]:
+                            c.fill = fill
+                ws.freeze_panes = "A2"
+                # second sheet: only out-of-tolerance
+                ws2 = wb.create_sheet("outliers")
+                ws2.append(cols)
+                for r in rows:
+                    if r.get("status") == "outside":
+                        dt = r.get("datetime")
+                        ws2.append([dt.isoformat(sep=" ") if dt else "", r.get("date"), r.get("machine"),
+                                    r.get("energy"), r.get("check"), r.get("metric"), r.get("value"),
+                                    r.get("unit"), r.get("threshold"), r.get("status")])
+                wb.save(out_x)
+                msg += "\nנשמר Excel (+ גיליון outliers):\n%s" % out_x
+            except Exception as e:  # noqa: BLE001
+                msg += "\n(Excel נכשל: %s)" % e
+        messagebox.showinfo("ייצוא MPC", msg)
+        self._open(out_csv)
+
+    @staticmethod
+    def _attach_identify(fig, ax, canvas, xnums, yvals, labels, info_label):
+        """Click a point on the chart to identify it (nearest point → label + annotation)."""
+        import numpy as _np
+        state = {"ann": None}
+        xn = _np.asarray(xnums, float)
+        yn = _np.asarray(yvals, float)
+
+        def on_click(event):
+            if event.inaxes is not ax or event.xdata is None:
+                return
+            xr = (xn.max() - xn.min()) or 1.0
+            yr = (_np.nanmax(yn) - _np.nanmin(yn)) or 1.0
+            d = ((xn - event.xdata) / xr) ** 2 + ((yn - event.ydata) / yr) ** 2
+            i = int(_np.argmin(d))
+            if state["ann"]:
+                try:
+                    state["ann"].remove()
+                except Exception:  # noqa: BLE001
+                    pass
+            state["ann"] = ax.annotate(
+                labels[i], xy=(xn[i], yn[i]), xytext=(12, 12), textcoords="offset points",
+                fontsize=8, bbox=dict(boxstyle="round", fc="#fff3cd", ec="#e15759"),
+                arrowprops=dict(arrowstyle="->", color="#e15759"))
+            info_label.config(text="נבחר: " + labels[i])
+            canvas.draw_idle()
+        canvas.mpl_connect("button_press_event", on_click)
+
     def show_mpc_trend(self):
         if not self.mpc_rows:
             messagebox.showinfo("MPC", "קודם לחץ 'טען MPC'."); return
@@ -1005,11 +1090,15 @@ class App(object):
             if thr is not None:
                 ax.axhline(thr, color="#e15759", ls=":", lw=1.3, label="טולרנס ±%g" % thr)
                 ax.axhline(-thr, color="#e15759", ls=":", lw=1.3)
-            ax.set_title("MPC: %s" % v_metric.get()); ax.legend(fontsize=7, loc="upper left")
+            ax.set_title("MPC: %s  (לחץ נקודה לזיהוי)" % v_metric.get()); ax.legend(fontsize=7, loc="upper left")
             fig.autofmt_xdate(); fig.tight_layout(); canvas.draw()
             n_out = sum(1 for r in rows if r["status"] == "outside")
             summary.config(text="n={0} | X̄={1:.4g} | σ̂={2:.4g} | טווח {3}→{4} | מחוץ-לטולרנס: {5}".format(
                 imr["n"], imr["xbar"], imr["sigma"], rows[0]["date"], rows[-1]["date"], n_out))
+            import matplotlib.dates as _md
+            labels = ["%s | %s | %s | %g%s | %s" % (r["date"], r["machine"], r["energy"],
+                      r["value"], r.get("unit", ""), r["status"]) for r in rows]
+            App._attach_identify(fig, ax, canvas, _md.date2num(dts), vals, labels, summary)
         for cb in ctl.winfo_children():
             if isinstance(cb, ttk.Combobox):
                 cb.bind("<<ComboboxSelected>>", redraw)
@@ -1344,7 +1433,13 @@ class App(object):
             ax2.axhline(ew["ucl"], color="#e15759", ls="--", lw=1)
             ax2.axhline(ew["lcl"], color="#e15759", ls="--", lw=1)
             ax2.set_title("EWMA (זיהוי סחף איטי)"); ax2.legend(fontsize=7, loc="upper left")
+            ax1.set_title("I-chart: %s  (לחץ נקודה לזיהוי)" % v_metric.get())
             fig.autofmt_xdate(); fig.tight_layout(); canvas.draw()
+            import matplotlib.dates as _md
+            labels = ["%s | מטופל %s | %s | %g" % (
+                r["_dt"].date().isoformat(), r.get("patient_id", ""),
+                r.get("filename", "")[:34], v) for r, v in zip(rows, vals)]
+            App._attach_identify(fig, ax1, canvas, _md.date2num(dts), vals, labels, summary)
             txt = ("n={n} | X̄={xbar:.4g} | σ̂={sig:.4g} | UCL={ucl:.4g} LCL={lcl:.4g} | "
                    "TG-218 TL={tl:.4g} | מחוץ לבקרה: {ooc}").format(
                 n=imr["n"], xbar=imr["xbar"], sig=imr["sigma"], ucl=imr["ucl"],
