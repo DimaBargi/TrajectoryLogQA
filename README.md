@@ -1,3 +1,25 @@
+# TrajectoryLogQA
+
+**Open-source analysis of Varian TrueBeam trajectory logs and Machine Performance Check (MPC) data for linac quality assurance.**
+
+A pure-Python TrueBeam trajectory-log (`.bin`) reader validated byte-for-byte against pylinac
+(MLC RMS agreement < 0.3%), together with an MPC Session-report parser, statistical process
+control (I-MR + EWMA control charts), plan-complexity and fluence/gamma metrics, per-fraction
+machine-health signals, and cross-source linkage to ArcCHECK QA and ARIA treatment records.
+
+Used in: *"Five-year statistical process control of Machine Performance Check across a
+five–TrueBeam fleet"* (in preparation).
+
+## Citation
+If you use this software, please cite:
+> Bragilovski D. TrajectoryLogQA: open-source TrueBeam trajectory-log and MPC analysis for
+> linac QA. Davidoff Cancer Center, 2026. https://github.com/DimaBargi/TrajectoryLogQA
+
+## License
+MIT (see LICENSE).
+
+---
+
 # Davidoff Physics – Trajectory Log QA
 
 A click-button Windows app that analyzes TrueBeam **Trajectory Log `.bin`** files and
