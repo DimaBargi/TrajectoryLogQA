@@ -6,7 +6,7 @@
 ; ============================================================
 
 #define MyAppName "Davidoff Physics Trajectory Log"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.1"
 #define MyAppExeName "TrajectoryLogQA.exe"
 
 [Setup]

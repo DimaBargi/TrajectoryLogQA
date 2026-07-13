@@ -188,6 +188,95 @@ def _qa_parse(text):
             "device": dev}
 
 
+# ---- Rich patient-QA extraction (analysis-ready export) ----
+QA_ANALYSIS_COLS = [
+    "filename", "patient_id", "patient_name", "plan_date", "device", "machine",
+    "treatment", "gamma_dose_pct", "gamma_dist_mm", "criteria", "threshold_pct",
+    "mode", "global_pct", "meas_uncert", "total_points", "passed", "failed",
+    "percent_passed", "below_action",
+]
+
+
+def _qa_parse_full(text, filename):
+    """Extract a wide, analysis-ready field set from one patient QA report.
+
+    Robust across ArcCHECK / MapCHECK / SRS MapCHECK layouts. Fields that are
+    absent in a given report come back empty rather than breaking the row."""
+    import datetime as _dt
+
+    def val(pat, cast=str, flags=re.I):
+        m = re.search(pat, text, flags)
+        if not m:
+            return None
+        try:
+            return cast(m.group(1).strip())
+        except (ValueError, AttributeError):
+            return None
+
+    dev = ("SRS MapCHECK" if re.search(r"SRS\s*M(ap)?C", text[:400], re.I)
+           else "ArcCHECK" if "ArcCHECK" in text[:600]
+           else "MapCHECK" if "MapCHECK" in text[:600] else "")
+    tot = val(r"Total\s*Points\s*:?\s*([0-9]+)", int)
+    fail = val(r"Failed\s*:?\s*([0-9]+)", int)
+    pct = val(r"%\s*Passed\s*:?\s*([0-9.]+)", float)
+    plan_date = None
+    m = re.search(r"Plan\s*Date\s*:?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})", text)
+    if m:
+        try:
+            plan_date = _dt.datetime.strptime(m.group(1), "%m/%d/%Y").date().isoformat()
+        except ValueError:
+            plan_date = None
+    mach = re.search(r"[_\s](LA?[1-5])\b", filename, re.I)
+    ttype = next((t for t in ("SBRT", "SRS", "IMRT", "VMAT", "TBI")
+                  if re.search(t, filename, re.I)), "")
+    dose = val(r"Difference\s*\(%\)\s*:?\s*([0-9.]+)", float)
+    dist = val(r"Distance\s*\(mm\)\s*:?\s*([0-9.]+)", float)
+    crit = ("%g%%/%gmm" % (dose, dist)) if (dose is not None and dist is not None) else ""
+    passed = (tot - fail) if (tot is not None and fail is not None) else None
+    below = ("" if pct is None else ("yes" if pct < QA_ACTION_LIMIT else "no"))
+    return {
+        "filename": filename,
+        "patient_id": val(r"Patient\s*ID\s*:?\s*(\S+)") or "",
+        "patient_name": val(r"Patient\s*Name\s*:?\s*([^\n]+?)\s*$", str, re.I | re.M) or "",
+        "plan_date": plan_date or "",
+        "device": dev,
+        "machine": (mach.group(1).upper() if mach else ""),
+        "treatment": ttype,
+        "gamma_dose_pct": dose,
+        "gamma_dist_mm": dist,
+        "criteria": crit,
+        "threshold_pct": val(r"Threshold\s*\(%\)\s*:?\s*([0-9.]+)", float),
+        "mode": ("3D" if "3D Mode" in text else "2D"),
+        "global_pct": val(r"Use\s*Global\s*%\s*:?\s*(Yes|No)") or "",
+        "meas_uncert": val(r"Meas\s*Uncertainty\s*:?\s*(Yes|No)") or "",
+        "total_points": tot,
+        "passed": passed,
+        "failed": fail,
+        "percent_passed": pct,
+        "below_action": below,
+    }
+
+
+def load_qa_analysis_folder(folder, progress_cb):
+    """Parse every patient QA PDF in a folder -> rich rows for data analysis."""
+    pdfs = []
+    for dp, _, fns in os.walk(folder):
+        for fn in fns:
+            if fn.lower().endswith(".pdf"):
+                pdfs.append(os.path.join(dp, fn))
+    pdfs.sort()
+    rows = []
+    for i, p in enumerate(pdfs, 1):
+        progress_cb(i, len(pdfs), os.path.basename(p))
+        try:
+            r = _qa_parse_full(_qa_layout(p), os.path.basename(p))
+            if r["patient_id"] or r["percent_passed"] is not None:
+                rows.append(r)
+        except Exception:  # noqa: BLE001
+            pass
+    return rows
+
+
 def load_qa_folder(folder, progress_cb):
     """Parse all QA PDFs in a folder → list of measurement dicts."""
     pdfs = []
@@ -744,6 +833,8 @@ class App(object):
         ttk.Button(flt, text="מפת fluence", command=self.show_fluence).pack(side="left", padx=2)
         ttk.Button(flt, text="outliers / מטופלים", command=self.show_outliers).pack(side="left", padx=2)
         ttk.Button(flt, text="טען QA (ArcCHECK)", command=self.load_qa).pack(side="left", padx=2)
+        ttk.Button(flt, text="ייצא QA מטופלים לניתוח",
+                   command=self.export_qa_analysis).pack(side="left", padx=2)
         ttk.Button(flt, text="טען RTRECORD", command=self.load_rtrecord).pack(side="left", padx=2)
         ttk.Label(flt, text=":חיפוש").pack(side="right")
         e = ttk.Entry(flt, textvariable=self.search, width=16); e.pack(side="right", padx=6)
@@ -1674,6 +1765,108 @@ class App(object):
         messagebox.showinfo("QA נטען",
                             "נטענו {0} מדידות QA; הותאמו ל-{1} לוגים.\n"
                             "פתח 'outliers / מטופלים' לתצוגת חזוי-מול-נמדד.".format(nmeas, nmatch))
+
+    def export_qa_analysis(self):
+        """Parse a whole patient-QA folder and export an analysis-ready CSV + Excel."""
+        if not _PDFMINER_OK:
+            messagebox.showwarning("לא זמין", "pdfminer לא מותקן בגרסה זו."); return
+        folder = filedialog.askdirectory(title="בחר תיקיית QA מטופלים (PDF)")
+        if not folder:
+            return
+        win = tk.Toplevel(self.master); win.title("מייצא QA מטופלים..."); win.geometry("460x90")
+        lbl = ttk.Label(win, text="מנתח דוחות QA..."); lbl.pack(pady=8)
+        pb = ttk.Progressbar(win, mode="determinate"); pb.pack(fill="x", padx=10)
+
+        def prog(d, t, m):
+            self.master.after(0, lambda: (pb.configure(maximum=t, value=d),
+                                          lbl.configure(text="QA {0}/{1}".format(d, t))))
+
+        def work():
+            try:
+                rows = load_qa_analysis_folder(folder, prog)
+                out = self._write_qa_analysis(folder, rows)
+                self.master.after(0, lambda: (win.destroy(), self._qa_analysis_done(out, rows)))
+            except Exception as e:  # noqa: BLE001
+                self.master.after(0, lambda: (win.destroy(), messagebox.showerror("שגיאה", str(e))))
+        th = threading.Thread(target=work); th.daemon = True; th.start()
+
+    def _write_qa_analysis(self, folder, rows):
+        """Write patient_qa_analysis.csv (+ .xlsx with a summary sheet). Returns csv path."""
+        rows = sorted(rows, key=lambda r: (r.get("plan_date") or "", r.get("patient_id") or ""))
+        out_csv = os.path.join(folder, "patient_qa_analysis.csv")
+        with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=QA_ANALYSIS_COLS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+        if _OPENPYXL_OK:
+            try:
+                self._write_qa_analysis_xlsx(folder, rows)
+            except Exception:  # noqa: BLE001
+                pass
+        return out_csv
+
+    def _write_qa_analysis_xlsx(self, folder, rows):
+        wb = openpyxl.Workbook()
+        ws = wb.active; ws.title = "QA"
+        hf = PatternFill("solid", fgColor="305496"); hfont = Font(bold=True, color="FFFFFF")
+        fail_fill = PatternFill("solid", fgColor="F8CBAD")
+        warn_fill = PatternFill("solid", fgColor="FFEB9C")
+        ws.append(QA_ANALYSIS_COLS)
+        for c in ws[1]:
+            c.fill, c.font, c.alignment = hf, hfont, Alignment(horizontal="center")
+        for r in rows:
+            ws.append([r.get(k) for k in QA_ANALYSIS_COLS])
+            pct = r.get("percent_passed")
+            if pct is not None:
+                if pct < QA_ACTION_LIMIT:
+                    for c in ws[ws.max_row]:
+                        c.fill = fail_fill
+                elif pct < 95.0:
+                    for c in ws[ws.max_row]:
+                        c.fill = warn_fill
+        ws.freeze_panes = "A2"
+        # summary sheet: pass-rate stats by device and by gamma criteria
+        ws2 = wb.create_sheet("summary")
+        vals = [r["percent_passed"] for r in rows if r.get("percent_passed") is not None]
+        n = len(vals)
+        mean = sum(vals) / n if n else 0.0
+        below = sum(1 for v in vals if v < QA_ACTION_LIMIT)
+        ws2.append(["metric", "value"])
+        ws2.append(["reports parsed", len(rows)])
+        ws2.append(["mean % passed", round(mean, 2)])
+        ws2.append(["min % passed", round(min(vals), 2) if vals else ""])
+        ws2.append(["below action (%.0f%%)" % QA_ACTION_LIMIT, below])
+        ws2.append([])
+        ws2.append(["by device", "n", "mean % passed", "# below action"])
+        for dev in sorted(set(r.get("device", "") for r in rows)):
+            dv = [r["percent_passed"] for r in rows
+                  if r.get("device") == dev and r.get("percent_passed") is not None]
+            if dv:
+                ws2.append([dev or "(unknown)", len(dv), round(sum(dv) / len(dv), 2),
+                            sum(1 for v in dv if v < QA_ACTION_LIMIT)])
+        ws2.append([])
+        ws2.append(["by criteria", "n", "mean % passed", "# below action"])
+        for crit in sorted(set(r.get("criteria", "") for r in rows if r.get("criteria"))):
+            cv = [r["percent_passed"] for r in rows
+                  if r.get("criteria") == crit and r.get("percent_passed") is not None]
+            if cv:
+                ws2.append([crit, len(cv), round(sum(cv) / len(cv), 2),
+                            sum(1 for v in cv if v < QA_ACTION_LIMIT)])
+        for c in ws2[1]:
+            c.fill, c.font = hf, hfont
+        wb.save(os.path.join(folder, "patient_qa_analysis.xlsx"))
+
+    def _qa_analysis_done(self, out_csv, rows):
+        vals = [r["percent_passed"] for r in rows if r.get("percent_passed") is not None]
+        mean = sum(vals) / len(vals) if vals else 0.0
+        below = sum(1 for v in vals if v < QA_ACTION_LIMIT)
+        xlsx = " + Excel" if _OPENPYXL_OK else ""
+        messagebox.showinfo(
+            "ייצוא QA הושלם",
+            "נותחו {0} דוחות QA.\nנשמר: patient_qa_analysis.csv{1}\n\n"
+            "ממוצע % עובר: {2:.1f}%  |  מתחת לסף ({3:.0f}%): {4} דוחות\n"
+            "(גיליון 'summary' מפרט לפי מכשיר וקריטריון גמא)".format(
+                len(rows), xlsx, mean, QA_ACTION_LIMIT, below))
 
     def load_rtrecord(self):
         if not self.rows:
