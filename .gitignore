@@ -4,3 +4,16 @@ Output/
 *.spec
 __pycache__/
 *.pyc
+
+# Clinical data must never be committed (patient IDs in logs/exports)
+*.bin
+*.csv
+*.xlsx
+*.xls
+*.db
+*.sqlite
+*.sqlite3
+*.dcm
+*.pdf
+exports/
+data/
